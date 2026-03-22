@@ -2,719 +2,326 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>DJ Lab Sync</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>">
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
-html,body,#root{height:100%;width:100%}
-body{background:#08090d;overflow-x:hidden;-webkit-text-size-adjust:100%}
-::selection{background:rgba(6,214,160,0.3)}
-input[type="range"]{-webkit-appearance:none;appearance:none;height:4px;background:rgba(255,255,255,0.08);border-radius:2px;outline:none}
-input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#06d6a0;cursor:pointer;border:2px solid #08090d}
-select option{background:#1a1d27;color:#e0e4ec}
-@keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:0.3}}
-@keyframes spin{to{transform:rotate(360deg)}}
-@keyframes fade-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-.fade-in{animation:fade-in 0.4s ease both}
-.fd1{animation-delay:0.06s}.fd2{animation-delay:0.12s}.fd3{animation-delay:0.18s}
-::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.08);border-radius:3px}
-@media(max-width:768px){.host-grid{grid-template-columns:1fr!important}.room-sidebar{order:-1}}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}html,body,#root{height:100%;width:100%}body{background:#08090d;overflow-x:hidden}::selection{background:rgba(6,214,160,0.3)}
+input[type="range"]{-webkit-appearance:none;height:4px;background:rgba(255,255,255,0.08);border-radius:2px;outline:none}input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#06d6a0;cursor:pointer;border:2px solid #08090d}
+select option{background:#1a1d27;color:#e0e4ec}@keyframes pd{0%,100%{opacity:1}50%{opacity:0.3}}@keyframes spin{to{transform:rotate(360deg)}}@keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}.fi{animation:fi .4s ease both}.fd1{animation-delay:.06s}.fd2{animation-delay:.12s}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.08);border-radius:3px}@media(max-width:768px){.hg{grid-template-columns:1fr!important}.rs{order:-1}}
 </style>
 </head>
-<body>
-<div id="root"></div>
+<body><div id="root"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script type="text/babel">
-const {useState,useRef,useEffect,useCallback} = React;
+const{useState,useRef,useEffect}=React;
+const WS=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";
+const SR=48000,CHUNK=8192,BUF_SEC=5,RING_SEC=60,RING_LEN=SR*RING_SEC;
 
-// ════════════════════════════════════════════════════
-//  CONFIG
-// ════════════════════════════════════════════════════
-const WS_URL = window.location.protocol === "https:"
-  ? `wss://${window.location.host}/ws`
-  : `ws://${window.location.host}/ws`;
-
-const SAMPLE_RATE = 48000;
-const CHUNK_SIZE = 4096;          // samples per chunk (~85ms)
-const BUFFER_DELAY_SEC = 2.0;     // seconds of buffer before playback (sync precision)
-const SYNC_INTERVAL_MS = 2000;    // clock sync ping interval
-const SYNC_SAMPLES = 10;          // keep N best samples
-
-// ════════════════════════════════════════════════════
-//  NTP-STYLE CLOCK SYNC
-// ════════════════════════════════════════════════════
-class ClockSync {
-  constructor(sendFn) {
-    this.sendFn = sendFn;
-    this.samples = [];
-    this.offset = 0;  // serverTime = Date.now() + offset
-    this.rtt = 0;
-    this.id = 0;
+// ══════════════ NTP CLOCK (40 samples, best-RTT offset like Beatsync) ══════════════
+class Clock{
+  constructor(fn){this.fn=fn;this.s=[];this.off=0;this.rtt=0;this.n=0;}
+  ping(){this.fn({type:"sync-ping",id:++this.n,ct:Date.now()});}
+  pong(m){
+    const rtt=Date.now()-m.ct,off=m.t-m.ct-rtt/2;
+    this.s.push({off,rtt});if(this.s.length>40)this.s.shift();
+    // Use offset from lowest-RTT measurement (most accurate, like Beatsync)
+    const best=[...this.s].sort((a,b)=>a.rtt-b.rtt);
+    const useN=Math.max(1,Math.floor(best.length/2));
+    let sum=0;for(let i=0;i<useN;i++)sum+=best[i].off;
+    this.off=sum/useN;this.rtt=rtt;
   }
-  ping() {
-    this.sendFn({ type:"sync-ping", id:++this.id, clientSendTime:Date.now() });
-  }
-  handlePong(msg) {
-    const now = Date.now();
-    const rtt = now - msg.clientSendTime;
-    const offset = msg.serverTime - msg.clientSendTime - rtt/2;
-    this.samples.push({offset,rtt});
-    if (this.samples.length > SYNC_SAMPLES) this.samples.shift();
-    // Use median offset (robust to outliers)
-    const sorted = [...this.samples].sort((a,b)=>a.offset-b.offset);
-    this.offset = sorted[Math.floor(sorted.length/2)].offset;
-    this.rtt = rtt;
-  }
-  serverNow() { return Date.now() + this.offset; }
+  now(){return Date.now()+this.off;}
 }
 
-// ════════════════════════════════════════════════════
-//  AUDIO CHUNK PROTOCOL
-// ════════════════════════════════════════════════════
-// Binary format: [Uint32 seq (4 bytes)][Float64 serverTime (8 bytes)][Int16 PCM data]
-function unpackChunk(buffer) {
-  const dv = new DataView(buffer);
-  const seq = dv.getUint32(0, true);
-  const serverTime = dv.getFloat64(4, true);
-  const pcm = new Int16Array(buffer, 12);
-  return {seq, serverTime, pcm};
-}
-
-// Convert Int16 PCM → Float32 for Web Audio API
-function int16ToFloat32(int16) {
-  const f32 = new Float32Array(int16.length);
-  for (let i=0; i<int16.length; i++) f32[i] = int16[i] / 32768;
-  return f32;
-}
-
-// ════════════════════════════════════════════════════
-//  STYLES
-// ════════════════════════════════════════════════════
-const S = {
-  font:"'Outfit',sans-serif", mono:"'JetBrains Mono',monospace",
-  accent:"#06d6a0", dim:"rgba(6,214,160,0.15)", glow:"0 0 30px rgba(6,214,160,0.25)",
-  glass:{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:14,backdropFilter:"blur(20px)",WebkitBackdropFilter:"blur(20px)"},
-};
-const NOUNS=["bass","kick","snare","reverb","echo","pulse","drop","groove","tempo","vinyl","synth","delay","loop","pitch","wave","beat","fader","filter","tone","phase"];
-const ADJS=["cosmic","neon","solar","lunar","crystal","shadow","golden","velvet","arctic","ember","azure","crimson","jade","amber","violet","coral","phantom","electric","turbo","silent"];
-function genName(){return ADJS[Math.floor(Math.random()*ADJS.length)]+"-"+NOUNS[Math.floor(Math.random()*NOUNS.length)];}
-function fmtTime(s){if(!isFinite(s))return"0:00";return`${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,"0")}`;}
-
-// ════════════════════════════════════════════════════
-//  SHARED UI COMPONENTS
-// ════════════════════════════════════════════════════
-function AmbientBG(){return(<>
-  <div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0,opacity:0.03,backgroundImage:`url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`}}/>
-  <div style={{position:"fixed",top:"-40%",left:"-20%",width:"80%",height:"80%",background:"radial-gradient(circle, rgba(6,214,160,0.04) 0%, transparent 65%)",filter:"blur(100px)",pointerEvents:"none",zIndex:0}}/>
-  <div style={{position:"fixed",bottom:"-30%",right:"-15%",width:"70%",height:"70%",background:"radial-gradient(circle, rgba(6,182,212,0.03) 0%, transparent 65%)",filter:"blur(100px)",pointerEvents:"none",zIndex:0}}/>
-</>);}
-
-function Logo({size="md"}){
-  const sz=size==="lg"?42:32,fs=size==="lg"?28:20;
-  return(<div style={{display:"flex",alignItems:"center",gap:10,justifyContent:size==="lg"?"center":"flex-start"}}>
-    <div style={{width:sz,height:sz,borderRadius:10,background:`linear-gradient(135deg,${S.accent},#06b6d4)`,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:S.glow}}>
-      <svg width={sz*0.5} height={sz*0.5} viewBox="0 0 24 24" fill="none" stroke="#08090d" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
-    </div>
-    <div><span style={{fontSize:fs,fontWeight:700,letterSpacing:"-0.04em",background:"linear-gradient(135deg,#e0e4ec,#94a3b8)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>DJ Lab</span><span style={{fontSize:fs,fontWeight:300,color:S.accent,marginLeft:6}}>Sync</span></div>
-  </div>);
-}
-
-function Btn({children,variant="primary",onClick,disabled,style:sx,...r}){
-  const base={padding:"11px 22px",borderRadius:10,border:"none",fontFamily:S.font,fontWeight:600,fontSize:13,cursor:disabled?"not-allowed":"pointer",transition:"all 0.2s",display:"inline-flex",alignItems:"center",gap:8,opacity:disabled?0.4:1};
-  const v={primary:{background:`linear-gradient(135deg,${S.accent},#06b6d4)`,color:"#08090d",boxShadow:"0 4px 20px rgba(6,214,160,0.25)"},secondary:{background:"rgba(255,255,255,0.05)",color:"#94a3b8",border:"1px solid rgba(255,255,255,0.08)"},danger:{background:"rgba(239,68,68,0.15)",color:"#ef4444",border:"1px solid rgba(239,68,68,0.2)"}};
-  return <button onClick={onClick} disabled={disabled} style={{...base,...v[variant],...sx}} {...r}>{children}</button>;
-}
-
-function Pill({status,label}){
-  const c={live:{bg:"rgba(6,214,160,0.12)",fg:S.accent},idle:{bg:"rgba(255,255,255,0.04)",fg:"#64748b"},connecting:{bg:"rgba(245,158,11,0.12)",fg:"#f59e0b"},error:{bg:"rgba(239,68,68,0.12)",fg:"#ef4444"}}[status]||{bg:"rgba(255,255,255,0.04)",fg:"#64748b"};
-  return(<div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 12px",borderRadius:20,background:c.bg,fontSize:12,fontWeight:500,color:c.fg}}>
-    <div style={{width:6,height:6,borderRadius:"50%",background:c.fg,animation:status==="live"?"pulse-dot 2s ease infinite":"none"}}/>{label}
-  </div>);
-}
-
-function Waveform({analyser,active,height=140}){
-  const ref=useRef();const anim=useRef();
-  useEffect(()=>{
-    const c=ref.current;if(!c)return;const ctx=c.getContext("2d");const dpr=window.devicePixelRatio||1;
-    function resize(){const r=c.getBoundingClientRect();c.width=r.width*dpr;c.height=r.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);}
-    resize();window.addEventListener("resize",resize);
-    function draw(){
-      anim.current=requestAnimationFrame(draw);const r=c.getBoundingClientRect(),w=r.width,h=r.height;ctx.clearRect(0,0,w,h);
-      if(!analyser||!active){ctx.strokeStyle="rgba(6,214,160,0.15)";ctx.lineWidth=1.5;ctx.beginPath();const t=Date.now()/1000;for(let x=0;x<w;x++){const y=h/2+Math.sin(x/w*6+t*2)*2;x===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}ctx.stroke();return;}
-      const bl=analyser.frequencyBinCount,fd=new Uint8Array(bl);analyser.getByteFrequencyData(fd);
-      const bc=Math.min(100,Math.floor(w/6)),bw=w/bc,gap=2;
-      for(let i=0;i<bc;i++){const idx=Math.floor(Math.pow(i/bc,1.5)*bl*0.6),val=fd[idx]/255,bh=Math.max(2,val*h*0.9);
-        const g=ctx.createLinearGradient(0,h,0,h-bh);g.addColorStop(0,"rgba(6,214,160,0.7)");g.addColorStop(0.4,"rgba(6,182,212,0.5)");g.addColorStop(1,"rgba(6,214,160,0.05)");
-        ctx.fillStyle=g;const x=i*bw+gap/2,bwd=bw-gap,rr=Math.min(2,bwd/2);
-        ctx.beginPath();ctx.moveTo(x+rr,h-bh);ctx.lineTo(x+bwd-rr,h-bh);ctx.quadraticCurveTo(x+bwd,h-bh,x+bwd,h-bh+rr);ctx.lineTo(x+bwd,h);ctx.lineTo(x,h);ctx.lineTo(x,h-bh+rr);ctx.quadraticCurveTo(x,h-bh,x+rr,h-bh);ctx.fill();}
-      const td=new Uint8Array(bl);analyser.getByteTimeDomainData(td);ctx.strokeStyle="rgba(6,214,160,0.3)";ctx.lineWidth=1.5;ctx.beginPath();
-      for(let i=0;i<bl;i++){const x=(i/bl)*w,y=(td[i]/255)*h;i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}ctx.stroke();
+// ══════════════ CAPTURE WORKLET (host side, off main thread) ══════════════
+const CAP_CODE=`
+class C extends AudioWorkletProcessor{
+  constructor(o){super();this.sz=o.processorOptions.sz||8192;this.b=new Float32Array(this.sz);this.p=0;}
+  process(ins){
+    const i=ins[0];if(!i||!i[0])return true;
+    const L=i[0],R=i.length>1&&i[1]?i[1]:L;
+    for(let j=0;j<L.length;j++){
+      this.b[this.p++]=(L[j]+R[j])*0.5;
+      if(this.p>=this.sz){
+        const o=new Int16Array(this.sz);
+        for(let k=0;k<this.sz;k++)o[k]=Math.max(-32768,Math.min(32767,Math.round(this.b[k]*32767)));
+        this.port.postMessage(o.buffer,[o.buffer]);
+        this.p=0;
+      }
     }
-    draw();return()=>{cancelAnimationFrame(anim.current);window.removeEventListener("resize",resize);};
-  },[analyser,active]);
-  return <canvas ref={ref} style={{width:"100%",height,borderRadius:10,background:"rgba(0,0,0,0.3)",display:"block"}}/>;
+    return true;
+  }
 }
+registerProcessor('cap',C);
+`;
 
-function VUMeter({analyser,active}){
-  const [level,setLevel]=useState(0);const raf=useRef();
-  useEffect(()=>{
-    if(!analyser||!active){setLevel(0);return;}const d=new Uint8Array(analyser.frequencyBinCount);
-    function tick(){raf.current=requestAnimationFrame(tick);analyser.getByteFrequencyData(d);let s=0;for(let i=0;i<d.length;i++)s+=d[i];setLevel(s/d.length/255);}
-    tick();return()=>cancelAnimationFrame(raf.current);
-  },[analyser,active]);
-  const db=level>0?Math.max(-60,20*Math.log10(level)):-60,pct=Math.max(0,(db+60)/60*100);
-  return(<div style={{display:"flex",alignItems:"center",gap:10,fontSize:12}}>
-    <span style={{color:"#64748b",fontFamily:S.mono,minWidth:50,fontSize:11}}>{level>0.001?`${db.toFixed(0)} dB`:"— dB"}</span>
-    <div style={{flex:1,height:6,background:"rgba(255,255,255,0.05)",borderRadius:3,overflow:"hidden"}}>
-      <div style={{width:`${pct}%`,height:"100%",borderRadius:3,transition:"width 0.08s linear",background:pct>85?"linear-gradient(90deg,#06d6a0,#f59e0b,#ef4444)":pct>50?"linear-gradient(90deg,#06d6a0,#06b6d4)":S.accent}}/>
-    </div>
-  </div>);
-}
-
-
-// ════════════════════════════════════════════════════
-//  LANDING PAGE
-// ════════════════════════════════════════════════════
-function Landing({onHost,onJoin}){
-  const [code,setCode]=useState("");const [name]=useState(genName);
-  useEffect(()=>{const r=new URLSearchParams(window.location.search).get("room");if(r)setCode(r.toUpperCase());},[]);
-  return(
-    <div style={{fontFamily:S.font,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:20,position:"relative",overflow:"hidden"}}>
-      <AmbientBG/>
-      <div style={{position:"relative",zIndex:1,textAlign:"center",maxWidth:440,width:"100%"}}>
-        <div className="fade-in" style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(6,214,160,0.08)",border:"1px solid rgba(6,214,160,0.15)",borderRadius:20,padding:"6px 16px",fontSize:12,color:S.accent,marginBottom:28,fontWeight:500}}>
-          <span style={{fontSize:10}}>●</span> Synchronized Multi-Device Audio
-        </div>
-        <div className="fade-in fd1"><Logo size="lg"/></div>
-        <p className="fade-in fd1" style={{color:"#64748b",fontSize:14,lineHeight:1.6,marginTop:12,marginBottom:36}}>
-          Turn every device into a synchronized speaker.<br/>Capture live audio and stream it perfectly in sync.
-        </p>
-        <div className="fade-in fd2" style={{...S.glass,padding:"28px 24px",marginBottom:16,textAlign:"left"}}>
-          <h3 style={{fontSize:15,fontWeight:600,marginBottom:4}}>🎧 Host a Session</h3>
-          <p style={{fontSize:12,color:"#64748b",marginBottom:18,lineHeight:1.5}}>Capture audio from your DJM-A9 or any source. Everyone hears it in perfect sync.</p>
-          <Btn onClick={()=>onHost(name)} style={{width:"100%",justifyContent:"center"}}>Create Room</Btn>
-        </div>
-        <div className="fade-in fd3" style={{...S.glass,padding:"28px 24px",textAlign:"left"}}>
-          <h3 style={{fontSize:15,fontWeight:600,marginBottom:4}}>📱 Join a Room</h3>
-          <p style={{fontSize:12,color:"#64748b",marginBottom:14,lineHeight:1.5}}>Enter a room code to listen in sync with everyone.</p>
-          <div style={{display:"flex",gap:10}}>
-            <input value={code} onChange={e=>setCode(e.target.value.toUpperCase())} placeholder="Room code..." maxLength={5}
-              style={{flex:1,padding:"10px 14px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#e0e4ec",fontSize:15,fontFamily:S.mono,fontWeight:600,letterSpacing:"0.2em",outline:"none",textAlign:"center"}}
-              onKeyDown={e=>{if(e.key==="Enter"&&code.length>=3)onJoin(code,name);}}
-            />
-            <Btn onClick={()=>code.length>=3&&onJoin(code,name)} disabled={code.length<3}>Join</Btn>
-          </div>
-          <div style={{marginTop:12,fontSize:12,color:"#475569",display:"flex",alignItems:"center",gap:6}}>
-            Joining as <span style={{fontFamily:S.mono,fontSize:11,fontWeight:500,background:S.dim,color:S.accent,padding:"2px 8px",borderRadius:4}}>{name}</span>
-          </div>
-        </div>
-        <p style={{marginTop:24,fontSize:11,color:"#334155"}}>Built for The DJ Lab · thedjlab.ca</p>
-      </div>
-    </div>
-  );
-}
-
-
-// ════════════════════════════════════════════════════
-//  HOST VIEW — Capture audio, send PCM chunks to server
-// ════════════════════════════════════════════════════
-function HostView({userName,onLeave}){
-  const [devices,setDevices]=useState([]);
-  const [selDev,setSelDev]=useState("");
-  const [mode,setMode]=useState("device");
-  const [capturing,setCapturing]=useState(false);
-  const [monitorOn,setMonitorOn]=useState(false);
-  const [error,setError]=useState(null);
-  const [elapsed,setElapsed]=useState(0);
-  const [wsOk,setWsOk]=useState(false);
-  const [roomCode,setRoomCode]=useState("...");
-  const [listeners,setListeners]=useState([]);
-  const [,fup]=useState(0);
-
-  const wsRef=useRef();const ctxRef=useRef();const analyserRef=useRef();
-  const srcRef=useRef();const procRef=useRef();const streamRef=useRef();
-  const startRef=useRef();const timerRef=useRef();const clockRef=useRef();
-  const syncIntRef=useRef();const monGainRef=useRef();
-
-  // Connect WS
-  useEffect(()=>{
-    const ws=new WebSocket(WS_URL);wsRef.current=ws;
-    ws.onopen=()=>setWsOk(true);
-    ws.onerror=()=>setWsOk(false);
-    ws.onclose=()=>setWsOk(false);
-    ws.onmessage=(e)=>{
-      if(typeof e.data!=="string")return;
-      const m=JSON.parse(e.data);
-      if(m.type==="welcome"){
-        clockRef.current=new ClockSync(msg=>ws.readyState===1&&ws.send(JSON.stringify(msg)));
-        ws.send(JSON.stringify({type:"create-room",name:userName}));
-      }
-      if(m.type==="room-created"){
-        setRoomCode(m.roomCode);
-        clockRef.current?.ping();
-        syncIntRef.current=setInterval(()=>clockRef.current?.ping(),SYNC_INTERVAL_MS);
-      }
-      if(m.type==="sync-pong")clockRef.current?.handlePong(m);
-      if(m.type==="listener-joined")setListeners(p=>[...p,{peerId:m.peerId,name:m.name}]);
-      if(m.type==="listener-left")setListeners(p=>p.filter(l=>l.peerId!==m.peerId));
-    };
-    return()=>{ws.close();clearInterval(syncIntRef.current);};
-  },[]);
-
-  // Enumerate devices
-  useEffect(()=>{
-    (async()=>{try{const t=await navigator.mediaDevices.getUserMedia({audio:true});t.getTracks().forEach(t=>t.stop());
-      setDevices((await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="audioinput"));}catch(e){}})();
-    return()=>stopCapture();
-  },[]);
-
-  // Timer
-  useEffect(()=>{
-    if(capturing){startRef.current=Date.now();timerRef.current=setInterval(()=>setElapsed(Math.floor((Date.now()-startRef.current)/1000)),1000);}
-    else{clearInterval(timerRef.current);setElapsed(0);}
-    return()=>clearInterval(timerRef.current);
-  },[capturing]);
-
-  async function startCapture(){
-    setError(null);
-    try{
-      let stream;
-      if(mode==="system"){
-        stream=await navigator.mediaDevices.getDisplayMedia({video:{width:1,height:1},audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:SAMPLE_RATE}});
-        if(!stream.getAudioTracks().length){stream.getTracks().forEach(t=>t.stop());setError("No audio. Check 'Share audio' — share a Chrome Tab.");return;}
-        stream.getVideoTracks().forEach(t=>t.stop());
-      } else {
-        stream=await navigator.mediaDevices.getUserMedia({audio:{deviceId:selDev?{exact:selDev}:undefined,echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:SAMPLE_RATE,channelCount:2}});
-      }
-      streamRef.current=stream;
-
-      const ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SAMPLE_RATE});
-      ctxRef.current=ctx;
-      const source=ctx.createMediaStreamSource(stream);
-      srcRef.current=source;
-
-      // Analyser for visualization
-      const analyser=ctx.createAnalyser();analyser.fftSize=2048;analyser.smoothingTimeConstant=0.8;
-      source.connect(analyser);analyserRef.current=analyser;
-
-      // Monitor gain (for local playback toggle)
-      const monGain=ctx.createGain();monGain.gain.value=0;
-      source.connect(monGain);monGain.connect(ctx.destination);
-      monGainRef.current=monGain;
-
-      // ScriptProcessor to capture PCM chunks and send to server
-      const proc=ctx.createScriptProcessor(CHUNK_SIZE,2,1);
-      proc.onaudioprocess=(ev)=>{
-        const ws=wsRef.current;if(!ws||ws.readyState!==1)return;
-        const left=ev.inputBuffer.getChannelData(0);
-        const right=ev.inputBuffer.numberOfChannels>1?ev.inputBuffer.getChannelData(1):left;
-        // Mix to mono Int16
-        const mono=new Int16Array(left.length);
-        for(let i=0;i<left.length;i++){
-          const sample=(left[i]+right[i])*0.5;
-          mono[i]=Math.max(-32768,Math.min(32767,Math.round(sample*32768)));
+// ══════════════ PLAYBACK WORKLET (listener side — continuous ring buffer read) ══════════════
+// This is the KEY difference from v2. Instead of scheduling hundreds of tiny AudioBufferSourceNodes,
+// we have ONE worklet that reads continuously from a ring buffer at hardware rate.
+// Zero chunk boundaries. Zero clicks. Smooth as vinyl.
+const PLAY_CODE=`
+class P extends AudioWorkletProcessor{
+  constructor(o){
+    super();
+    this.ring=new Float32Array(${RING_LEN});  // 60s ring buffer
+    this.wPos=0;      // write position (set by main thread)
+    this.rPos=0;      // read position
+    this.started=false;
+    this.vol=1.0;
+    this.port.onmessage=(e)=>{
+      const d=e.data;
+      if(d.type==='samples'){
+        // Write float32 samples into ring buffer at the specified position
+        const s=new Float32Array(d.buf);
+        const wp=d.pos % ${RING_LEN};
+        for(let i=0;i<s.length;i++){
+          this.ring[(wp+i)%${RING_LEN}]=s[i];
         }
-        ws.send(mono.buffer);
-      };
-      source.connect(proc);proc.connect(ctx.destination); // must connect to destination for ScriptProcessor to fire
-      procRef.current=proc;
-
-      // Tell server we're streaming
-      wsRef.current?.readyState===1&&wsRef.current.send(JSON.stringify({type:"host-streaming",streaming:true}));
-
-      setCapturing(true);fup(n=>n+1);
-      stream.getTracks().forEach(t=>{t.onended=()=>stopCapture();});
-    }catch(err){
-      if(err.name==="NotAllowedError")setError("Permission denied.");
-      else if(err.name==="NotFoundError")setError("No audio device found.");
-      else setError("Error: "+err.message);
+      }
+      if(d.type==='start'){this.rPos=d.rPos;this.started=true;}
+      if(d.type==='vol'){this.vol=d.v;}
+    };
+  }
+  process(ins,outs){
+    if(!this.started){
+      // Output silence
+      outs[0][0].fill(0);
+      return true;
     }
+    const out=outs[0][0];
+    for(let i=0;i<out.length;i++){
+      out[i]=this.ring[this.rPos%${RING_LEN}]*this.vol;
+      this.rPos++;
+    }
+    // Report read position back to main thread periodically
+    if(this.rPos%${SR}===0){
+      this.port.postMessage({type:'pos',rPos:this.rPos});
+    }
+    return true;
   }
-
-  function stopCapture(){
-    if(wsRef.current?.readyState===1)wsRef.current.send(JSON.stringify({type:"host-streaming",streaming:false}));
-    if(procRef.current){try{procRef.current.disconnect();}catch(e){}procRef.current=null;}
-    if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}
-    if(ctxRef.current){ctxRef.current.close().catch(()=>{});ctxRef.current=null;}
-    analyserRef.current=null;srcRef.current=null;monGainRef.current=null;
-    setCapturing(false);setMonitorOn(false);fup(n=>n+1);
-  }
-
-  // Monitor toggle
-  useEffect(()=>{
-    if(monGainRef.current)monGainRef.current.gain.value=monitorOn?1:0;
-  },[monitorOn]);
-
-  const qrData=encodeURIComponent(`${window.location.origin}${window.location.pathname}?room=${roomCode}`);
-  const qrUrl=`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${qrData}&bgcolor=08090d&color=06d6a0&format=svg`;
-
-  return(
-    <div style={{fontFamily:S.font,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",position:"relative",overflow:"hidden"}}>
-      <AmbientBG/>
-      <div style={{position:"relative",zIndex:1,maxWidth:960,margin:"0 auto",padding:"20px 20px 40px"}}>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24,flexWrap:"wrap",gap:12}}>
-          <Logo/>
-          <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-            <Pill status={!wsOk?"error":capturing?"live":"idle"} label={!wsOk?"Server Error":capturing?`LIVE · ${fmtTime(elapsed)}`:"Ready"}/>
-            <Btn variant="danger" onClick={()=>{stopCapture();wsRef.current?.send(JSON.stringify({type:"leave-room"}));onLeave();}} style={{padding:"8px 14px",fontSize:12}}>Leave</Btn>
-          </div>
-        </div>
-
-        {!wsOk&&<div style={{padding:"12px 16px",borderRadius:10,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.15)",marginBottom:16,fontSize:13,color:"#fca5a5"}}>
-          Could not connect to server. Check your internet connection.
-        </div>}
-
-        <div className="host-grid" style={{display:"grid",gridTemplateColumns:"1fr 300px",gap:20,alignItems:"start"}}>
-          <div style={{display:"flex",flexDirection:"column",gap:16}}>
-            {/* Audio Source */}
-            <div className="fade-in" style={{...S.glass,padding:"22px 20px"}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:8}}>
-                <h3 style={{fontSize:14,fontWeight:600,margin:0}}>Audio Source</h3>
-                <div style={{display:"flex",background:"rgba(255,255,255,0.04)",borderRadius:8,overflow:"hidden",border:"1px solid rgba(255,255,255,0.06)"}}>
-                  {[{k:"device",l:"🎛 Audio Device"},{k:"system",l:"🖥 System Audio"}].map(m=>(
-                    <button key={m.k} onClick={()=>!capturing&&setMode(m.k)} style={{padding:"6px 14px",border:"none",fontSize:12,fontWeight:500,fontFamily:S.font,cursor:capturing?"not-allowed":"pointer",background:mode===m.k?S.dim:"transparent",color:mode===m.k?S.accent:"#64748b",transition:"all 0.2s"}}>{m.l}</button>
-                  ))}
-                </div>
-              </div>
-              {mode==="device"?(
-                <div style={{marginBottom:14}}>
-                  <select value={selDev} onChange={e=>setSelDev(e.target.value)} style={{width:"100%",padding:"10px 14px",borderRadius:8,background:"rgba(255,255,255,0.04)",color:"#e0e4ec",border:"1px solid rgba(255,255,255,0.08)",fontSize:13,fontFamily:S.font,outline:"none",cursor:"pointer",appearance:"none",backgroundImage:`url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E")`,backgroundRepeat:"no-repeat",backgroundPosition:"right 12px center"}}>
-                    <option value="">Select audio source...</option>
-                    {devices.map(d=><option key={d.deviceId} value={d.deviceId}>{d.label||`Device ${d.deviceId.slice(0,8)}`}</option>)}
-                  </select>
-                  <p style={{fontSize:11,color:"#475569",marginTop:8}}>Your DJM-A9 will appear here as a USB audio device.</p>
-                </div>
-              ):(
-                <div style={{padding:"14px 16px",borderRadius:8,background:"rgba(6,214,160,0.05)",border:"1px solid rgba(6,214,160,0.1)",marginBottom:14}}>
-                  <p style={{fontSize:12,color:"#94a3b8",lineHeight:1.6,margin:0}}><strong style={{color:S.accent}}>System Audio</strong><br/>Share a <strong>Chrome Tab</strong> and check <strong>"Also share tab audio"</strong>.</p>
-                </div>
-              )}
-              <div style={{display:"flex",gap:10}}>
-                {!capturing
-                  ?<Btn onClick={startCapture} disabled={!wsOk} style={{flex:1,justifyContent:"center"}}>▶ Start Broadcasting</Btn>
-                  :<Btn variant="danger" onClick={stopCapture} style={{flex:1,justifyContent:"center"}}>⏹ Stop</Btn>}
-              </div>
-              {error&&<div style={{marginTop:12,padding:"10px 14px",borderRadius:8,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.15)",fontSize:12,color:"#fca5a5"}}>{error}</div>}
-            </div>
-            {/* Waveform */}
-            <div className="fade-in fd1" style={{...S.glass,padding:"18px 18px 14px"}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
-                <h3 style={{fontSize:14,fontWeight:600,margin:0}}>{capturing?"Live Audio":"Preview"}</h3>
-                {capturing&&<div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:S.accent,fontFamily:S.mono}}>
-                  <div style={{width:5,height:5,borderRadius:"50%",background:S.accent,animation:"pulse-dot 1.5s ease infinite"}}/>48kHz</div>}
-              </div>
-              <Waveform analyser={analyserRef.current} active={capturing} height={140}/>
-              <div style={{marginTop:10}}><VUMeter analyser={analyserRef.current} active={capturing}/></div>
-            </div>
-          </div>
-
-          {/* Sidebar */}
-          <div className="room-sidebar" style={{display:"flex",flexDirection:"column",gap:16}}>
-            <div className="fade-in" style={{...S.glass,padding:"22px 20px",textAlign:"center"}}>
-              <p style={{fontSize:11,color:"#64748b",marginBottom:6,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:600}}>Room Code</p>
-              <div style={{fontSize:36,fontWeight:800,letterSpacing:"0.15em",fontFamily:S.mono,color:S.accent,textShadow:"0 0 30px rgba(6,214,160,0.3)",marginBottom:16}}>{roomCode}</div>
-              <div style={{width:160,height:160,margin:"0 auto 12px",background:"#0d1117",borderRadius:12,padding:10,border:"1px solid rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center"}}>
-                {roomCode!=="..."&&<img src={qrUrl} alt="QR" style={{width:140,height:140,borderRadius:6}} onError={e=>{e.target.style.display="none"}}/>}
-              </div>
-              <p style={{fontSize:11,color:"#475569"}}>Scan to join · {BUFFER_DELAY_SEC}s sync buffer</p>
-            </div>
-
-            <div className="fade-in fd1" style={{...S.glass,padding:"18px 16px"}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
-                <h3 style={{fontSize:14,fontWeight:600,margin:0}}>Listeners</h3>
-                <span style={{fontSize:11,fontFamily:S.mono,color:S.accent,background:S.dim,padding:"2px 8px",borderRadius:4}}>{listeners.length}</span>
-              </div>
-              {listeners.length===0?<p style={{fontSize:12,color:"#475569",textAlign:"center",padding:"16px 0",fontStyle:"italic"}}>Waiting for listeners...</p>
-              :<div style={{display:"flex",flexDirection:"column",gap:8}}>
-                {listeners.map(l=><div key={l.peerId} style={{...S.glass,padding:"10px 14px",display:"flex",alignItems:"center",gap:10}}>
-                  <span style={{fontSize:16}}>📱</span>
-                  <div style={{flex:1}}><div style={{fontSize:13,fontWeight:500}}>{l.name}</div>
-                    <div style={{fontSize:10,color:S.accent,fontFamily:S.mono}}>● synced</div></div>
-                </div>)}
-              </div>}
-            </div>
-
-            <div className="fade-in fd2" style={{...S.glass,padding:"14px 16px",cursor:capturing?"pointer":"default"}} onClick={()=>capturing&&setMonitorOn(!monitorOn)}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-                <div><div style={{fontSize:13,fontWeight:500}}>Local Monitor</div><div style={{fontSize:11,color:"#64748b"}}>Hear audio on this device</div></div>
-                <div style={{width:40,height:22,borderRadius:11,background:monitorOn?"rgba(6,214,160,0.3)":"rgba(255,255,255,0.08)",position:"relative",transition:"background 0.2s"}}>
-                  <div style={{width:16,height:16,borderRadius:"50%",position:"absolute",top:3,left:monitorOn?21:3,transition:"all 0.2s",background:monitorOn?S.accent:"#475569"}}/>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
 }
+registerProcessor('play',P);
+`;
 
+function mkURL(code){const b=new Blob([code],{type:"application/javascript"});return URL.createObjectURL(b);}
 
-// ════════════════════════════════════════════════════
-//  LISTENER VIEW — Receive chunks, schedule synced playback
-// ════════════════════════════════════════════════════
-function ListenerView({roomCode,userName,onLeave}){
-  const [wsOk,setWsOk]=useState(false);
-  const [joined,setJoined]=useState(false);
-  const [hostName,setHostName]=useState("Host");
-  const [streaming,setStreaming]=useState(false);
-  const [playing,setPlaying]=useState(false);
-  const [volume,setVolume]=useState(85);
-  const [latency,setLatency]=useState(null);
-  const [syncOffset,setSyncOffset]=useState(null);
-  const [error,setError]=useState(null);
-  const [chunksReceived,setChunksReceived]=useState(0);
-  const [,fup]=useState(0);
+// ══════════════ CHUNK PROTOCOL ══════════════
+function unpack(buf){const d=new DataView(buf);return{seq:d.getUint32(0,true),t:d.getFloat64(4,true),pcm:new Int16Array(buf,12)};}
+function i16f32(i){const f=new Float32Array(i.length);for(let j=0;j<i.length;j++)f[j]=i[j]/32768;return f;}
 
-  const wsRef=useRef();const ctxRef=useRef();const gainRef=useRef();
-  const analyserRef=useRef();const clockRef=useRef();const syncIntRef=useRef();
-  const ctxStartRef=useRef(0); // Date.now() when AudioContext was created
-  const scheduledUntilRef=useRef(0); // audioCtx.currentTime up to which we've scheduled
-  const chunkCountRef=useRef(0);
+// ══════════════ STYLES ══════════════
+const S={f:"'Outfit',sans-serif",m:"'JetBrains Mono',monospace",a:"#06d6a0",d:"rgba(6,214,160,0.15)",
+  g:{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:14,backdropFilter:"blur(20px)",WebkitBackdropFilter:"blur(20px)"}};
+const AD=["cosmic","neon","solar","lunar","crystal","shadow","golden","velvet","arctic","ember","azure","crimson","jade","amber","violet","coral","phantom","electric","turbo","silent"];
+const NO=["bass","kick","snare","reverb","echo","pulse","drop","groove","tempo","vinyl","synth","delay","loop","pitch","wave","beat","fader","filter","tone","phase"];
+function gn(){return AD[Math.floor(Math.random()*AD.length)]+"-"+NO[Math.floor(Math.random()*NO.length)];}
+function ft(s){if(!isFinite(s))return"0:00";return`${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,"0")}`;}
 
-  // Create AudioContext on mount (needs user gesture — handled by Join button or auto-join tap)
+// ══════════════ UI COMPONENTS ══════════════
+function BG(){return(<><div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0,opacity:0.03,backgroundImage:`url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`}}/><div style={{position:"fixed",top:"-40%",left:"-20%",width:"80%",height:"80%",background:"radial-gradient(circle,rgba(6,214,160,0.04) 0%,transparent 65%)",filter:"blur(100px)",pointerEvents:"none",zIndex:0}}/></>);}
+function Logo({big}){const z=big?42:32,f=big?28:20;return(<div style={{display:"flex",alignItems:"center",gap:10,justifyContent:big?"center":"flex-start"}}><div style={{width:z,height:z,borderRadius:10,background:`linear-gradient(135deg,${S.a},#06b6d4)`,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 0 30px rgba(6,214,160,0.25)"}}><svg width={z*.5} height={z*.5} viewBox="0 0 24 24" fill="none" stroke="#08090d" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div><div><span style={{fontSize:f,fontWeight:700,letterSpacing:"-0.04em",background:"linear-gradient(135deg,#e0e4ec,#94a3b8)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>DJ Lab</span><span style={{fontSize:f,fontWeight:300,color:S.a,marginLeft:6}}>Sync</span></div></div>);}
+function Btn({children,v="primary",onClick,disabled,style:sx,...r}){const b={padding:"11px 22px",borderRadius:10,border:"none",fontFamily:S.f,fontWeight:600,fontSize:13,cursor:disabled?"not-allowed":"pointer",transition:"all 0.2s",display:"inline-flex",alignItems:"center",gap:8,opacity:disabled?0.4:1};const vs={primary:{background:`linear-gradient(135deg,${S.a},#06b6d4)`,color:"#08090d",boxShadow:"0 4px 20px rgba(6,214,160,0.25)"},secondary:{background:"rgba(255,255,255,0.05)",color:"#94a3b8",border:"1px solid rgba(255,255,255,0.08)"},danger:{background:"rgba(239,68,68,0.15)",color:"#ef4444",border:"1px solid rgba(239,68,68,0.2)"}};return<button onClick={onClick} disabled={disabled} style={{...b,...vs[v],...sx}} {...r}>{children}</button>;}
+function Pill({s,label}){const c={live:{bg:"rgba(6,214,160,0.12)",fg:S.a},idle:{bg:"rgba(255,255,255,0.04)",fg:"#64748b"},connecting:{bg:"rgba(245,158,11,0.12)",fg:"#f59e0b"},error:{bg:"rgba(239,68,68,0.12)",fg:"#ef4444"}}[s]||{bg:"rgba(255,255,255,0.04)",fg:"#64748b"};return(<div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 12px",borderRadius:20,background:c.bg,fontSize:12,fontWeight:500,color:c.fg}}><div style={{width:6,height:6,borderRadius:"50%",background:c.fg,animation:s==="live"?"pd 2s ease infinite":"none"}}/>{label}</div>);}
+function Wave({analyser,on,h=140}){const ref=useRef();const af=useRef();useEffect(()=>{const c=ref.current;if(!c)return;const x=c.getContext("2d");const dp=devicePixelRatio||1;function rs(){const r=c.getBoundingClientRect();c.width=r.width*dp;c.height=r.height*dp;x.setTransform(dp,0,0,dp,0,0);}rs();addEventListener("resize",rs);function draw(){af.current=requestAnimationFrame(draw);const r=c.getBoundingClientRect(),w=r.width,ht=r.height;x.clearRect(0,0,w,ht);if(!analyser||!on){x.strokeStyle="rgba(6,214,160,0.15)";x.lineWidth=1.5;x.beginPath();const t=Date.now()/1000;for(let i=0;i<w;i++){const y=ht/2+Math.sin(i/w*6+t*2)*2;i===0?x.moveTo(i,y):x.lineTo(i,y);}x.stroke();return;}const bl=analyser.frequencyBinCount,fd=new Uint8Array(bl);analyser.getByteFrequencyData(fd);const bc=Math.min(100,Math.floor(w/6)),bw=w/bc,gp=2;for(let i=0;i<bc;i++){const idx=Math.floor(Math.pow(i/bc,1.5)*bl*0.6),v=fd[idx]/255,bh=Math.max(2,v*ht*0.9);const g=x.createLinearGradient(0,ht,0,ht-bh);g.addColorStop(0,"rgba(6,214,160,0.7)");g.addColorStop(0.4,"rgba(6,182,212,0.5)");g.addColorStop(1,"rgba(6,214,160,0.05)");x.fillStyle=g;const px=i*bw+gp/2,bd=bw-gp,rr=Math.min(2,bd/2);x.beginPath();x.moveTo(px+rr,ht-bh);x.lineTo(px+bd-rr,ht-bh);x.quadraticCurveTo(px+bd,ht-bh,px+bd,ht-bh+rr);x.lineTo(px+bd,ht);x.lineTo(px,ht);x.lineTo(px,ht-bh+rr);x.quadraticCurveTo(px,ht-bh,px+rr,ht-bh);x.fill();}const td=new Uint8Array(bl);analyser.getByteTimeDomainData(td);x.strokeStyle="rgba(6,214,160,0.3)";x.lineWidth=1.5;x.beginPath();for(let i=0;i<bl;i++){const px=(i/bl)*w,py=(td[i]/255)*ht;i===0?x.moveTo(px,py):x.lineTo(px,py);}x.stroke();}draw();return()=>{cancelAnimationFrame(af.current);removeEventListener("resize",rs);};},[analyser,on]);return<canvas ref={ref} style={{width:"100%",height:h,borderRadius:10,background:"rgba(0,0,0,0.3)",display:"block"}}/>;}
+function VU({analyser,on}){const[lv,set]=useState(0);const rf=useRef();useEffect(()=>{if(!analyser||!on){set(0);return;}const d=new Uint8Array(analyser.frequencyBinCount);function t(){rf.current=requestAnimationFrame(t);analyser.getByteFrequencyData(d);let s=0;for(let i=0;i<d.length;i++)s+=d[i];set(s/d.length/255);}t();return()=>cancelAnimationFrame(rf.current);},[analyser,on]);const db=lv>0?Math.max(-60,20*Math.log10(lv)):-60,p=Math.max(0,(db+60)/60*100);return(<div style={{display:"flex",alignItems:"center",gap:10,fontSize:12}}><span style={{color:"#64748b",fontFamily:S.m,minWidth:50,fontSize:11}}>{lv>0.001?`${db.toFixed(0)} dB`:"— dB"}</span><div style={{flex:1,height:6,background:"rgba(255,255,255,0.05)",borderRadius:3,overflow:"hidden"}}><div style={{width:`${p}%`,height:"100%",borderRadius:3,transition:"width 0.08s linear",background:p>85?"linear-gradient(90deg,#06d6a0,#f59e0b,#ef4444)":p>50?"linear-gradient(90deg,#06d6a0,#06b6d4)":S.a}}/></div></div>);}
+
+// ══════════════ LANDING ══════════════
+function Landing({onHost,onJoin}){const[code,setCode]=useState("");const[name]=useState(gn);return(
+  <div style={{fontFamily:S.f,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:20,position:"relative",overflow:"hidden"}}><BG/><div style={{position:"relative",zIndex:1,textAlign:"center",maxWidth:440,width:"100%"}}>
+    <div className="fi" style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(6,214,160,0.08)",border:"1px solid rgba(6,214,160,0.15)",borderRadius:20,padding:"6px 16px",fontSize:12,color:S.a,marginBottom:28,fontWeight:500}}>● Synchronized Multi-Device Audio</div>
+    <div className="fi fd1"><Logo big/></div>
+    <p className="fi fd1" style={{color:"#64748b",fontSize:14,lineHeight:1.6,marginTop:12,marginBottom:36}}>Turn every device into a synchronized speaker.<br/>Live audio, perfectly in sync on every phone.</p>
+    <div className="fi fd1" style={{...S.g,padding:"28px 24px",marginBottom:16,textAlign:"left"}}><h3 style={{fontSize:15,fontWeight:600,marginBottom:4}}>🎧 Host</h3><p style={{fontSize:12,color:"#64748b",marginBottom:18,lineHeight:1.5}}>Capture from your mixer or any source. All phones play in perfect sync.</p><Btn onClick={()=>onHost(name)} style={{width:"100%",justifyContent:"center"}}>Create Room</Btn></div>
+    <div className="fi fd2" style={{...S.g,padding:"28px 24px",textAlign:"left"}}><h3 style={{fontSize:15,fontWeight:600,marginBottom:4}}>📱 Join</h3><p style={{fontSize:12,color:"#64748b",marginBottom:14,lineHeight:1.5}}>Enter a room code to listen.</p>
+      <div style={{display:"flex",gap:10}}><input value={code} onChange={e=>setCode(e.target.value.toUpperCase())} placeholder="Room code..." maxLength={5} style={{flex:1,padding:"10px 14px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#e0e4ec",fontSize:15,fontFamily:S.m,fontWeight:600,letterSpacing:"0.2em",outline:"none",textAlign:"center"}} onKeyDown={e=>{if(e.key==="Enter"&&code.length>=3)onJoin(code,name);}}/><Btn onClick={()=>code.length>=3&&onJoin(code,name)} disabled={code.length<3}>Join</Btn></div>
+      <div style={{marginTop:12,fontSize:12,color:"#475569",display:"flex",alignItems:"center",gap:6}}>As <span style={{fontFamily:S.m,fontSize:11,fontWeight:500,background:S.d,color:S.a,padding:"2px 8px",borderRadius:4}}>{name}</span></div>
+    </div><p style={{marginTop:24,fontSize:11,color:"#334155"}}>Built for The DJ Lab · thedjlab.ca</p>
+  </div></div>);}
+
+// ══════════════ HOST ══════════════
+function Host({userName,onLeave}){
+  const[devs,setDevs]=useState([]);const[sel,setSel]=useState("");const[mode,setMode]=useState("device");
+  const[cap,setCap]=useState(false);const[mon,setMon]=useState(false);const[err,setErr]=useState(null);
+  const[elapsed,setElapsed]=useState(0);const[wsOk,setWsOk]=useState(false);const[room,setRoom]=useState("...");
+  const[ls,setLs]=useState([]);const[,fup]=useState(0);
+  const ws=useRef();const ctx=useRef();const an=useRef();const stream=useRef();const wk=useRef();const mg=useRef();const ck=useRef();const si=useRef();const t0=useRef();const tmr=useRef();
+
+  useEffect(()=>{const w=new WebSocket(WS);ws.current=w;w.onopen=()=>setWsOk(true);w.onerror=()=>setWsOk(false);w.onclose=()=>setWsOk(false);
+    w.onmessage=e=>{if(typeof e.data!=="string")return;const m=JSON.parse(e.data);
+      if(m.type==="welcome"){ck.current=new Clock(o=>w.readyState===1&&w.send(JSON.stringify(o)));w.send(JSON.stringify({type:"create-room",name:userName,sr:SR}));}
+      if(m.type==="room-created"){setRoom(m.room);ck.current?.ping();si.current=setInterval(()=>ck.current?.ping(),2000);}
+      if(m.type==="sync-pong")ck.current?.pong(m);
+      if(m.type==="l+")setLs(p=>[...p,{id:m.id,name:m.name}]);
+      if(m.type==="l-")setLs(p=>p.filter(l=>l.id!==m.id));};
+    return()=>{w.close();clearInterval(si.current);};},[]);
+  useEffect(()=>{(async()=>{try{const t=await navigator.mediaDevices.getUserMedia({audio:true});t.getTracks().forEach(t=>t.stop());setDevs((await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="audioinput"));}catch(e){}})();return()=>stop();},[]);
+  useEffect(()=>{if(cap){t0.current=Date.now();tmr.current=setInterval(()=>setElapsed(Math.floor((Date.now()-t0.current)/1000)),1000);}else{clearInterval(tmr.current);setElapsed(0);}return()=>clearInterval(tmr.current);},[cap]);
+  useEffect(()=>{if(mg.current)mg.current.gain.value=mon?1:0;},[mon]);
+
+  async function start(){
+    setErr(null);try{let s;
+    if(mode==="system"){s=await navigator.mediaDevices.getDisplayMedia({video:{width:1,height:1},audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:SR}});if(!s.getAudioTracks().length){s.getTracks().forEach(t=>t.stop());setErr("No audio. Share a Chrome Tab, check 'Also share tab audio'.");return;}s.getVideoTracks().forEach(t=>t.stop());}
+    else{s=await navigator.mediaDevices.getUserMedia({audio:{deviceId:sel?{exact:sel}:undefined,echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:SR,channelCount:2}});}
+    stream.current=s;const c=new(AudioContext||webkitAudioContext)({sampleRate:SR});ctx.current=c;
+    const src=c.createMediaStreamSource(s);const a=c.createAnalyser();a.fftSize=2048;a.smoothingTimeConstant=0.8;src.connect(a);an.current=a;
+    const g=c.createGain();g.gain.value=0;src.connect(g);g.connect(c.destination);mg.current=g;
+    // AudioWorklet capture
+    let ok=false;try{const u=mkURL(CAP_CODE);await c.audioWorklet.addModule(u);URL.revokeObjectURL(u);
+      const n=new AudioWorkletNode(c,'cap',{processorOptions:{sz:CHUNK},numberOfInputs:1,numberOfOutputs:1,channelCount:2});
+      n.port.onmessage=ev=>{const w=ws.current;if(w&&w.readyState===1)w.send(ev.data);};
+      src.connect(n);n.connect(c.destination);wk.current=n;ok=true;}catch(e){console.warn("Worklet fail, using ScriptProcessor",e);}
+    if(!ok){const p=c.createScriptProcessor(CHUNK,2,1);p.onaudioprocess=ev=>{const w=ws.current;if(!w||w.readyState!==1)return;const L=ev.inputBuffer.getChannelData(0),R=ev.inputBuffer.numberOfChannels>1?ev.inputBuffer.getChannelData(1):L;const o=new Int16Array(L.length);for(let i=0;i<L.length;i++)o[i]=Math.max(-32768,Math.min(32767,Math.round(((L[i]+R[i])*.5)*32767)));w.send(o.buffer);};src.connect(p);p.connect(c.destination);wk.current=p;}
+    ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"host-live",live:true}));
+    setCap(true);fup(n=>n+1);s.getTracks().forEach(t=>{t.onended=()=>stop();});
+    }catch(e){if(e.name==="NotAllowedError")setErr("Permission denied.");else setErr("Error: "+e.message);}}
+
+  function stop(){ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"host-live",live:false}));
+    try{wk.current?.disconnect();}catch(e){}wk.current=null;if(stream.current){stream.current.getTracks().forEach(t=>t.stop());stream.current=null;}
+    if(ctx.current){ctx.current.close().catch(()=>{});ctx.current=null;}an.current=null;mg.current=null;setCap(false);setMon(false);fup(n=>n+1);}
+
+  const qr=room!=="..."?`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(location.origin+location.pathname+"?room="+room)}&bgcolor=08090d&color=06d6a0&format=svg`:"";
+  return(<div style={{fontFamily:S.f,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",position:"relative",overflow:"hidden"}}><BG/><div style={{position:"relative",zIndex:1,maxWidth:960,margin:"0 auto",padding:"20px 20px 40px"}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24,flexWrap:"wrap",gap:12}}><Logo/><div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}><Pill s={!wsOk?"error":cap?"live":"idle"} label={!wsOk?"Server Error":cap?`LIVE · ${ft(elapsed)}`:"Ready"}/><Btn v="danger" onClick={()=>{stop();ws.current?.send(JSON.stringify({type:"leave"}));onLeave();}} style={{padding:"8px 14px",fontSize:12}}>Leave</Btn></div></div>
+    {!wsOk&&<div style={{padding:"12px 16px",borderRadius:10,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.15)",marginBottom:16,fontSize:13,color:"#fca5a5"}}>Cannot connect to server.</div>}
+    <div className="hg" style={{display:"grid",gridTemplateColumns:"1fr 300px",gap:20,alignItems:"start"}}>
+      <div style={{display:"flex",flexDirection:"column",gap:16}}>
+        <div className="fi" style={{...S.g,padding:"22px 20px"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:8}}><h3 style={{fontSize:14,fontWeight:600,margin:0}}>Audio Source</h3>
+            <div style={{display:"flex",background:"rgba(255,255,255,0.04)",borderRadius:8,overflow:"hidden",border:"1px solid rgba(255,255,255,0.06)"}}>{[{k:"device",l:"🎛 Device"},{k:"system",l:"🖥 System"}].map(m=><button key={m.k} onClick={()=>!cap&&setMode(m.k)} style={{padding:"6px 14px",border:"none",fontSize:12,fontWeight:500,fontFamily:S.f,cursor:cap?"not-allowed":"pointer",background:mode===m.k?S.d:"transparent",color:mode===m.k?S.a:"#64748b",transition:"all 0.2s"}}>{m.l}</button>)}</div></div>
+          {mode==="device"?<div style={{marginBottom:14}}><select value={sel} onChange={e=>setSel(e.target.value)} style={{width:"100%",padding:"10px 14px",borderRadius:8,background:"rgba(255,255,255,0.04)",color:"#e0e4ec",border:"1px solid rgba(255,255,255,0.08)",fontSize:13,fontFamily:S.f,outline:"none",cursor:"pointer",appearance:"none"}}><option value="">Select audio source...</option>{devs.map(d=><option key={d.deviceId} value={d.deviceId}>{d.label||`Device ${d.deviceId.slice(0,8)}`}</option>)}</select></div>
+          :<div style={{padding:"14px 16px",borderRadius:8,background:"rgba(6,214,160,0.05)",border:"1px solid rgba(6,214,160,0.1)",marginBottom:14}}><p style={{fontSize:12,color:"#94a3b8",lineHeight:1.6,margin:0}}><strong style={{color:S.a}}>System Audio</strong> — Share a Chrome Tab, check "Also share tab audio".</p></div>}
+          <div style={{display:"flex",gap:10}}>{!cap?<Btn onClick={start} disabled={!wsOk} style={{flex:1,justifyContent:"center"}}>▶ Start Broadcasting</Btn>:<Btn v="danger" onClick={stop} style={{flex:1,justifyContent:"center"}}>⏹ Stop</Btn>}</div>
+          {err&&<div style={{marginTop:12,padding:"10px 14px",borderRadius:8,background:"rgba(239,68,68,0.08)",fontSize:12,color:"#fca5a5"}}>{err}</div>}
+        </div>
+        <div className="fi fd1" style={{...S.g,padding:"18px"}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}><h3 style={{fontSize:14,fontWeight:600,margin:0}}>{cap?"Live":"Preview"}</h3>{cap&&<div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:S.a,fontFamily:S.m}}><div style={{width:5,height:5,borderRadius:"50%",background:S.a,animation:"pd 1.5s ease infinite"}}/>48kHz</div>}</div><Wave analyser={an.current} on={cap} h={140}/><div style={{marginTop:10}}><VU analyser={an.current} on={cap}/></div></div>
+      </div>
+      <div className="rs" style={{display:"flex",flexDirection:"column",gap:16}}>
+        <div className="fi" style={{...S.g,padding:"22px 20px",textAlign:"center"}}><p style={{fontSize:11,color:"#64748b",marginBottom:6,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:600}}>Room</p><div style={{fontSize:36,fontWeight:800,letterSpacing:"0.15em",fontFamily:S.m,color:S.a,textShadow:"0 0 30px rgba(6,214,160,0.3)",marginBottom:16}}>{room}</div><div style={{width:160,height:160,margin:"0 auto 12px",background:"#0d1117",borderRadius:12,padding:10,border:"1px solid rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center"}}>{qr&&<img src={qr} alt="QR" style={{width:140,height:140,borderRadius:6}}/>}</div><p style={{fontSize:11,color:"#475569"}}>Scan to join · {BUF_SEC}s buffer</p></div>
+        <div className="fi fd1" style={{...S.g,padding:"18px 16px"}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}><h3 style={{fontSize:14,fontWeight:600,margin:0}}>Listeners</h3><span style={{fontSize:11,fontFamily:S.m,color:S.a,background:S.d,padding:"2px 8px",borderRadius:4}}>{ls.length}</span></div>{ls.length===0?<p style={{fontSize:12,color:"#475569",textAlign:"center",padding:"16px 0",fontStyle:"italic"}}>Waiting...</p>:<div style={{display:"flex",flexDirection:"column",gap:8}}>{ls.map(l=><div key={l.id} style={{...S.g,padding:"10px 14px",display:"flex",alignItems:"center",gap:10}}><span>📱</span><div style={{flex:1}}><div style={{fontSize:13,fontWeight:500}}>{l.name}</div><div style={{fontSize:10,color:S.a,fontFamily:S.m}}>● synced</div></div></div>)}</div>}</div>
+        <div className="fi fd2" style={{...S.g,padding:"14px 16px",cursor:cap?"pointer":"default"}} onClick={()=>cap&&setMon(!mon)}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}><div><div style={{fontSize:13,fontWeight:500}}>Monitor</div><div style={{fontSize:11,color:"#64748b"}}>Hear locally</div></div><div style={{width:40,height:22,borderRadius:11,background:mon?"rgba(6,214,160,0.3)":"rgba(255,255,255,0.08)",position:"relative",transition:"background 0.2s"}}><div style={{width:16,height:16,borderRadius:"50%",position:"absolute",top:3,left:mon?21:3,transition:"all 0.2s",background:mon?S.a:"#475569"}}/></div></div></div>
+      </div>
+    </div></div></div>);}
+
+// ══════════════ LISTENER — Ring buffer playback worklet ══════════════
+function Listener({roomCode,userName,onLeave}){
+  const[wsOk,setWsOk]=useState(false);const[joined,setJoined]=useState(false);const[host,setHost]=useState("Host");
+  const[live,setLive]=useState(false);const[playing,setPlaying]=useState(false);const[vol,setVol]=useState(85);
+  const[rtt,setRtt]=useState(null);const[off,setOff]=useState(null);const[err,setErr]=useState(null);const[,fup]=useState(0);
+
+  const ws=useRef();const ctx=useRef();const playNode=useRef();const anNode=useRef();const ck=useRef();const si=useRef();
+  // Stream tracking
+  const firstChunkTime=useRef(null);  // server time of first chunk received
+  const totalWritten=useRef(0);       // total samples written to ring buffer
+  const started=useRef(false);
+
   function initAudio(){
-    if(ctxRef.current)return;
-    const ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SAMPLE_RATE});
-    ctxRef.current=ctx;
-    ctxStartRef.current=Date.now();
-
-    const gain=ctx.createGain();gain.gain.value=volume/100;
-    gainRef.current=gain;
-
-    const analyser=ctx.createAnalyser();analyser.fftSize=2048;analyser.smoothingTimeConstant=0.8;
-    analyserRef.current=analyser;
-
-    gain.connect(analyser);analyser.connect(ctx.destination);
-
-    // Resume if suspended (mobile)
-    if(ctx.state==="suspended")ctx.resume();
-    fup(n=>n+1);
+    if(ctx.current)return;
+    const c=new(AudioContext||webkitAudioContext)({sampleRate:SR});ctx.current=c;
+    if(c.state==="suspended")c.resume();
   }
 
-  // Schedule a PCM chunk for synced playback
-  function scheduleChunk(seq, serverTime, pcmInt16){
-    const ctx=ctxRef.current;if(!ctx)return;
-    const clock=clockRef.current;if(!clock)return;
+  async function initPlayback(){
+    const c=ctx.current;if(!c||playNode.current)return;
+    try{
+      const u=mkURL(PLAY_CODE);await c.audioWorklet.addModule(u);URL.revokeObjectURL(u);
+      const node=new AudioWorkletNode(c,'play',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[1]});
+      const an=c.createAnalyser();an.fftSize=2048;an.smoothingTimeConstant=0.8;
+      node.connect(an);an.connect(c.destination);
+      playNode.current=node;anNode.current=an;
+      node.port.onmessage=(e)=>{/* readPos reports */};
+      fup(n=>n+1);
+    }catch(e){console.error("Playback worklet failed:",e);setErr("Audio playback not supported in this browser.");}
+  }
 
-    // Convert server time → local audioCtx time
-    // serverTime was when server received the chunk
-    // We want to play it at: serverTime + BUFFER_DELAY (in server time)
-    // Convert to client time: serverTime + BUFFER_DELAY - clock.offset
-    // Convert to audioCtx time: (clientTime - ctxStartRef.current) / 1000
-    const desiredPlayClientTime = serverTime + BUFFER_DELAY_SEC*1000 - clock.offset;
-    const playAt = (desiredPlayClientTime - ctxStartRef.current) / 1000;
+  function writeChunk(serverTime, pcmInt16){
+    if(!playNode.current)return;
+    const f32=i16f32(pcmInt16);
 
-    // If we're too late, skip this chunk
-    if(playAt < ctx.currentTime - 0.1) return;
+    // Track stream position
+    if(firstChunkTime.current===null){
+      firstChunkTime.current=serverTime;
+      totalWritten.current=0;
+    }
 
-    // Create buffer and schedule
-    const float32 = int16ToFloat32(pcmInt16);
-    const buffer = ctx.createBuffer(1, float32.length, SAMPLE_RATE);
-    buffer.getChannelData(0).set(float32);
+    // Calculate where in the ring buffer this chunk should go
+    // Position = how many samples since first chunk, based on server timestamp
+    const elapsedMs=serverTime-firstChunkTime.current;
+    const writePos=Math.round((elapsedMs/1000)*SR);
 
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(gainRef.current);
+    // Send samples to worklet
+    playNode.current.port.postMessage({type:'samples',buf:f32.buffer,pos:writePos},[f32.buffer]);
+    totalWritten.current=writePos+f32.length;
 
-    // Schedule at the precise time
-    const startTime = Math.max(playAt, ctx.currentTime);
-    source.start(startTime);
-
-    chunkCountRef.current++;
-    if(chunkCountRef.current % 12 === 0){ // update UI ~1/sec
-      setChunksReceived(chunkCountRef.current);
+    // Start playback after BUF_SEC seconds of data
+    if(!started.current && totalWritten.current>=SR*BUF_SEC){
+      started.current=true;
+      // Calculate read position: we want to read from BUF_SEC ago
+      // readPos = 0 means "the beginning of the stream"
+      // We want all devices to read the same position at the same server time
+      // readPos at serverNow = (serverNow - firstChunkTime - BUF_SEC*1000) / 1000 * SR
+      const serverNow=ck.current?.now()||Date.now();
+      const rPos=Math.max(0,Math.round(((serverNow-firstChunkTime.current)/1000-BUF_SEC)*SR));
+      playNode.current.port.postMessage({type:'start',rPos});
       setPlaying(true);
     }
   }
 
-  // Connect WebSocket
   useEffect(()=>{
-    initAudio(); // create AudioContext (user already tapped to get here)
-
-    const ws=new WebSocket(WS_URL);wsRef.current=ws;
-    ws.binaryType="arraybuffer";
-
-    ws.onopen=()=>setWsOk(true);
-    ws.onerror=()=>{setWsOk(false);setError("Could not connect to server.");};
-    ws.onclose=()=>setWsOk(false);
-
-    ws.onmessage=(e)=>{
-      // Binary = audio chunk
+    initAudio();
+    const w=new WebSocket(WS);ws.current=w;w.binaryType="arraybuffer";
+    w.onopen=()=>setWsOk(true);w.onerror=()=>{setWsOk(false);setErr("Cannot connect.");};w.onclose=()=>setWsOk(false);
+    w.onmessage=async(e)=>{
       if(e.data instanceof ArrayBuffer){
-        const {seq,serverTime,pcm}=unpackChunk(e.data);
-        scheduleChunk(seq,serverTime,pcm);
+        const{seq,t,pcm}=unpack(e.data);
+        writeChunk(t,pcm);
         return;
       }
-      // JSON = signaling
       const m=JSON.parse(e.data);
-      if(m.type==="welcome"){
-        clockRef.current=new ClockSync(msg=>ws.readyState===1&&ws.send(JSON.stringify(msg)));
-        ws.send(JSON.stringify({type:"join-room",roomCode,name:userName}));
-      }
-      if(m.type==="room-joined"){
-        setJoined(true);setHostName(m.hostName);setStreaming(m.isStreaming);
-        clockRef.current?.ping();
-        syncIntRef.current=setInterval(()=>{
-          clockRef.current?.ping();
-          setLatency(clockRef.current?.rtt||null);
-          setSyncOffset(clockRef.current?.offset||null);
-        },SYNC_INTERVAL_MS);
-      }
-      if(m.type==="sync-pong"){
-        clockRef.current?.handlePong(m);
-        setLatency(clockRef.current?.rtt||null);
-        setSyncOffset(clockRef.current?.offset||null);
-      }
-      if(m.type==="host-streaming")setStreaming(m.streaming);
-      if(m.type==="room-closed"){setError("Room closed: "+m.reason);setStreaming(false);setPlaying(false);}
-      if(m.type==="error"){setError(m.message);}
-      if(m.type==="buffer-start"){}  // chunks incoming
-      if(m.type==="buffer-end"){}    // initial buffer sent
+      if(m.type==="welcome"){ck.current=new Clock(o=>w.readyState===1&&w.send(JSON.stringify(o)));w.send(JSON.stringify({type:"join",room:roomCode,name:userName}));}
+      if(m.type==="joined"){setJoined(true);setHost(m.host);setLive(m.live);ck.current?.ping();si.current=setInterval(()=>{ck.current?.ping();setRtt(ck.current?.rtt||null);setOff(ck.current?.off||null);},2000);await initPlayback();}
+      if(m.type==="sync-pong"){ck.current?.pong(m);setRtt(ck.current?.rtt||null);setOff(ck.current?.off||null);}
+      if(m.type==="host-live"){setLive(m.live);if(!m.live){setPlaying(false);started.current=false;firstChunkTime.current=null;totalWritten.current=0;}}
+      if(m.type==="closed"){setErr("Room closed.");setPlaying(false);}
+      if(m.type==="error")setErr(m.msg);
     };
-
-    return()=>{
-      ws.close();clearInterval(syncIntRef.current);
-      if(ctxRef.current)ctxRef.current.close().catch(()=>{});
-    };
+    return()=>{w.close();clearInterval(si.current);if(ctx.current)ctx.current.close().catch(()=>{});};
   },[]);
 
-  // Volume control
-  useEffect(()=>{if(gainRef.current)gainRef.current.gain.value=volume/100;},[volume]);
+  useEffect(()=>{if(playNode.current)playNode.current.port.postMessage({type:'vol',v:vol/100});},[vol]);
 
-  function handleLeave(){
-    wsRef.current?.readyState===1&&wsRef.current.send(JSON.stringify({type:"leave-room"}));
-    if(ctxRef.current)ctxRef.current.close().catch(()=>{});
-    onLeave();
-  }
-
-  return(
-    <div style={{fontFamily:S.font,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,position:"relative",overflow:"hidden"}}>
-      <AmbientBG/>
-      <div style={{position:"relative",zIndex:1,maxWidth:420,width:"100%",textAlign:"center"}}>
-        <Logo/>
-        <div className="fade-in" style={{...S.glass,padding:"28px 24px",marginTop:24,textAlign:"left"}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
-            <Pill status={playing?"live":error?"error":!wsOk?"error":!joined?"connecting":"idle"}
-              label={playing?"Playing Synced":error?"Error":!wsOk?"Connecting...":!joined?"Joining...":streaming?"Buffering...":"Waiting for host"}/>
-            <span style={{fontFamily:S.mono,fontSize:14,fontWeight:600,color:S.accent,letterSpacing:"0.1em"}}>{roomCode}</span>
-          </div>
-
-          {error&&<div style={{padding:"12px 14px",borderRadius:8,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.15)",fontSize:12,color:"#fca5a5",lineHeight:1.5,marginBottom:16}}>{error}</div>}
-
-          {!joined&&!error&&(
-            <div style={{textAlign:"center",padding:"30px 0"}}>
-              <div style={{width:40,height:40,border:"3px solid rgba(6,214,160,0.2)",borderTopColor:S.accent,borderRadius:"50%",animation:"spin 0.8s linear infinite",margin:"0 auto 16px"}}/>
-              <p style={{fontSize:13,color:"#64748b"}}>{!wsOk?"Connecting to server...":"Joining room..."}</p>
-            </div>
-          )}
-
-          {joined&&!playing&&!error&&(
-            <div style={{textAlign:"center",padding:"24px 0"}}>
-              <div style={{width:40,height:40,border:"3px solid rgba(6,214,160,0.2)",borderTopColor:S.accent,borderRadius:"50%",animation:"spin 0.8s linear infinite",margin:"0 auto 16px"}}/>
-              <p style={{fontSize:13,color:"#64748b"}}>{streaming?"Buffering audio...":"Waiting for host to start broadcasting..."}</p>
-              <p style={{fontSize:11,color:"#475569",marginTop:8}}>Connected to {hostName}</p>
-            </div>
-          )}
-
-          {playing&&(<>
-            <div style={{textAlign:"center",padding:"16px 0 14px",borderBottom:"1px solid rgba(255,255,255,0.05)",marginBottom:16}}>
-              <p style={{fontSize:12,color:"#64748b",marginBottom:4}}>Now listening to</p>
-              <p style={{fontSize:18,fontWeight:700}}>{hostName}</p>
-            </div>
-
-            <div style={{marginBottom:16}}>
-              <Waveform analyser={analyserRef.current} active={true} height={80}/>
-            </div>
-
-            <div style={{marginTop:4}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
-                <span style={{fontSize:12,color:"#64748b"}}>Volume</span>
-                <span style={{fontSize:11,fontFamily:S.mono,color:"#94a3b8"}}>{volume}%</span>
-              </div>
-              <input type="range" min="0" max="100" value={volume} onChange={e=>setVolume(Number(e.target.value))} style={{width:"100%"}}/>
-            </div>
-
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginTop:16}}>
-              <div style={{textAlign:"center",padding:"10px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}>
-                <div style={{fontSize:16,fontWeight:700,color:S.accent,fontFamily:S.mono}}>{latency?`${latency}ms`:"—"}</div>
-                <div style={{fontSize:9,color:"#64748b"}}>Round-trip</div>
-              </div>
-              <div style={{textAlign:"center",padding:"10px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}>
-                <div style={{fontSize:16,fontWeight:700,color:S.accent,fontFamily:S.mono}}>{syncOffset!==null?`${Math.abs(Math.round(syncOffset))}ms`:"—"}</div>
-                <div style={{fontSize:9,color:"#64748b"}}>Clock Sync</div>
-              </div>
-              <div style={{textAlign:"center",padding:"10px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}>
-                <div style={{fontSize:16,fontWeight:700,color:S.accent,fontFamily:S.mono}}>{BUFFER_DELAY_SEC}s</div>
-                <div style={{fontSize:9,color:"#64748b"}}>Buffer</div>
-              </div>
-            </div>
-          </>)}
-
-          <Btn variant="secondary" onClick={handleLeave} style={{width:"100%",justifyContent:"center",marginTop:18}}>Leave Room</Btn>
-        </div>
+  return(<div style={{fontFamily:S.f,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,position:"relative",overflow:"hidden"}}><BG/><div style={{position:"relative",zIndex:1,maxWidth:420,width:"100%",textAlign:"center"}}><Logo/>
+    <div className="fi" style={{...S.g,padding:"28px 24px",marginTop:24,textAlign:"left"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+        <Pill s={playing?"live":err?"error":!wsOk?"error":!joined?"connecting":"idle"} label={playing?"Playing Synced":err?"Error":!wsOk?"Connecting...":!joined?"Joining...":live?"Buffering...":"Waiting for host"}/>
+        <span style={{fontFamily:S.m,fontSize:14,fontWeight:600,color:S.a,letterSpacing:"0.1em"}}>{roomCode}</span>
       </div>
-    </div>
-  );
+      {err&&<div style={{padding:"12px 14px",borderRadius:8,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.15)",fontSize:12,color:"#fca5a5",marginBottom:16}}>{err}</div>}
+      {!joined&&!err&&<div style={{textAlign:"center",padding:"30px 0"}}><div style={{width:40,height:40,border:"3px solid rgba(6,214,160,0.2)",borderTopColor:S.a,borderRadius:"50%",animation:"spin .8s linear infinite",margin:"0 auto 16px"}}/><p style={{fontSize:13,color:"#64748b"}}>{!wsOk?"Connecting...":"Joining..."}</p></div>}
+      {joined&&!playing&&!err&&<div style={{textAlign:"center",padding:"24px 0"}}><div style={{width:40,height:40,border:"3px solid rgba(6,214,160,0.2)",borderTopColor:S.a,borderRadius:"50%",animation:"spin .8s linear infinite",margin:"0 auto 16px"}}/><p style={{fontSize:13,color:"#64748b"}}>{live?"Buffering ("+BUF_SEC+"s)...":"Waiting for host..."}</p><p style={{fontSize:11,color:"#475569",marginTop:8}}>Connected to {host}</p></div>}
+      {playing&&<><div style={{textAlign:"center",padding:"16px 0 14px",borderBottom:"1px solid rgba(255,255,255,0.05)",marginBottom:16}}><p style={{fontSize:12,color:"#64748b",marginBottom:4}}>Now listening to</p><p style={{fontSize:18,fontWeight:700}}>{host}</p></div>
+        <div style={{marginBottom:16}}><Wave analyser={anNode.current} on={true} h={80}/></div>
+        <div><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}><span style={{fontSize:12,color:"#64748b"}}>Volume</span><span style={{fontSize:11,fontFamily:S.m,color:"#94a3b8"}}>{vol}%</span></div><input type="range" min="0" max="100" value={vol} onChange={e=>setVol(+e.target.value)} style={{width:"100%"}}/></div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginTop:16}}>
+          <div style={{textAlign:"center",padding:"10px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:16,fontWeight:700,color:S.a,fontFamily:S.m}}>{rtt?rtt+"ms":"—"}</div><div style={{fontSize:9,color:"#64748b"}}>RTT</div></div>
+          <div style={{textAlign:"center",padding:"10px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:16,fontWeight:700,color:S.a,fontFamily:S.m}}>{off!=null?Math.abs(Math.round(off))+"ms":"—"}</div><div style={{fontSize:9,color:"#64748b"}}>Sync</div></div>
+          <div style={{textAlign:"center",padding:"10px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:16,fontWeight:700,color:S.a,fontFamily:S.m}}>{BUF_SEC}s</div><div style={{fontSize:9,color:"#64748b"}}>Buffer</div></div>
+        </div></>}
+      <Btn v="secondary" onClick={()=>{ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"leave"}));ctx.current?.close().catch(()=>{});onLeave();}} style={{width:"100%",justifyContent:"center",marginTop:18}}>Leave</Btn>
+    </div></div></div>);
 }
 
-
-// ════════════════════════════════════════════════════
-//  APP — Auto-join from QR code URL
-// ════════════════════════════════════════════════════
+// ══════════════ APP ══════════════
 function App(){
-  const urlRoom=new URLSearchParams(window.location.search).get("room");
-  // If URL has ?room=, show a "Tap to Join" screen (needed for audio unlock on mobile)
-  const [view,setView]=useState(urlRoom?"autojoin":"landing");
-  const [roomCode,setRoomCode]=useState(urlRoom?urlRoom.toUpperCase():"");
-  const [userName]=useState(genName);
-
-  if(view==="autojoin"){
-    return(
-      <div style={{fontFamily:S.font,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,position:"relative",overflow:"hidden"}}>
-        <AmbientBG/>
-        <div style={{position:"relative",zIndex:1,textAlign:"center",maxWidth:400,width:"100%"}}>
-          <Logo size="lg"/>
-          <div className="fade-in" style={{...S.glass,padding:"32px 24px",marginTop:24}}>
-            <p style={{fontSize:14,color:"#94a3b8",marginBottom:6}}>Joining room</p>
-            <div style={{fontSize:42,fontWeight:800,fontFamily:S.mono,color:S.accent,letterSpacing:"0.15em",textShadow:"0 0 30px rgba(6,214,160,0.3)",marginBottom:20}}>{roomCode}</div>
-            <p style={{fontSize:12,color:"#64748b",marginBottom:24,lineHeight:1.5}}>
-              Joining as <span style={{color:S.accent,fontFamily:S.mono}}>{userName}</span>
-            </p>
-            <button onClick={()=>{setView("listener");window.history.replaceState({},"",window.location.pathname);}}
-              style={{
-                width:"100%",padding:"18px",borderRadius:14,border:"none",
-                background:`linear-gradient(135deg,${S.accent},#06b6d4)`,
-                color:"#08090d",fontSize:18,fontWeight:700,fontFamily:S.font,
-                cursor:"pointer",boxShadow:"0 8px 30px rgba(6,214,160,0.3)",
-                transition:"transform 0.2s",
-              }}
-              onMouseDown={e=>e.target.style.transform="scale(0.97)"}
-              onMouseUp={e=>e.target.style.transform="scale(1)"}
-            >
-              🔊 Tap to Join &amp; Listen
-            </button>
-            <p style={{fontSize:10,color:"#475569",marginTop:12}}>Audio plays automatically after tapping</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  return(<>
-    {view==="landing"&&<Landing
-      onHost={name=>{setRoomCode("");setView("host");}}
-      onJoin={(code,name)=>{setRoomCode(code);setView("listener");window.history.replaceState({},"",window.location.pathname);}}
-    />}
-    {view==="host"&&<HostView userName={userName} onLeave={()=>{setView("landing");setRoomCode("");}}/>}
-    {view==="listener"&&<ListenerView roomCode={roomCode} userName={userName} onLeave={()=>{setView("landing");setRoomCode("");}}/>}
-  </>);
+  const ur=new URLSearchParams(location.search).get("room");
+  const[v,setV]=useState(ur?"aj":"land");const[rc,setRc]=useState(ur?ur.toUpperCase():"");const[un]=useState(gn);
+  if(v==="aj")return(<div style={{fontFamily:S.f,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,position:"relative",overflow:"hidden"}}><BG/><div style={{position:"relative",zIndex:1,textAlign:"center",maxWidth:400,width:"100%"}}><Logo big/><div className="fi" style={{...S.g,padding:"32px 24px",marginTop:24}}><p style={{fontSize:14,color:"#94a3b8",marginBottom:6}}>Joining room</p><div style={{fontSize:42,fontWeight:800,fontFamily:S.m,color:S.a,letterSpacing:"0.15em",textShadow:"0 0 30px rgba(6,214,160,0.3)",marginBottom:20}}>{rc}</div><p style={{fontSize:12,color:"#64748b",marginBottom:24}}>as <span style={{color:S.a,fontFamily:S.m}}>{un}</span> · {BUF_SEC}s sync buffer</p><button onClick={()=>{setV("listen");history.replaceState({},"",location.pathname);}} style={{width:"100%",padding:"18px",borderRadius:14,border:"none",background:`linear-gradient(135deg,${S.a},#06b6d4)`,color:"#08090d",fontSize:18,fontWeight:700,fontFamily:S.f,cursor:"pointer",boxShadow:"0 8px 30px rgba(6,214,160,0.3)"}}>🔊 Tap to Join &amp; Listen</button><p style={{fontSize:10,color:"#475569",marginTop:12}}>This tap unlocks audio on your phone</p></div></div></div>);
+  return<>{v==="land"&&<Landing onHost={n=>{setV("host");}} onJoin={(c,n)=>{setRc(c);setV("listen");history.replaceState({},"",location.pathname);}}/>}{v==="host"&&<Host userName={un} onLeave={()=>{setV("land");setRc("");}}/>}{v==="listen"&&<Listener roomCode={rc} userName={un} onLeave={()=>{setV("land");setRc("");}}/>}</>;
 }
-
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
 </script>
 </body>
