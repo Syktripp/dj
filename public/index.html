@@ -215,8 +215,8 @@ function Listener({roomCode,userName,onLeave}){
 
   const ws=useRef();const ctx=useRef();const playNode=useRef();const anNode=useRef();const ck=useRef();const si=useRef();
   // Stream tracking
-  const firstChunkTime=useRef(null);  // server time of first chunk received
-  const totalWritten=useRef(0);       // total samples written to ring buffer
+  const streamStart=useRef(null);      // server time when stream started (from server, shared by ALL devices)
+  const totalWritten=useRef(0);
   const started=useRef(false);
 
   function initAudio(){
@@ -239,33 +239,22 @@ function Listener({roomCode,userName,onLeave}){
   }
 
   function writeChunk(serverTime, pcmInt16){
-    if(!playNode.current)return;
+    if(!playNode.current||!streamStart.current)return;
     const f32=i16f32(pcmInt16);
 
-    // Track stream position
-    if(firstChunkTime.current===null){
-      firstChunkTime.current=serverTime;
-      totalWritten.current=0;
-    }
-
-    // Calculate where in the ring buffer this chunk should go
-    // Position = how many samples since first chunk, based on server timestamp
-    const elapsedMs=serverTime-firstChunkTime.current;
+    // Write position based on server's stream start time (same for ALL devices)
+    const elapsedMs=serverTime-streamStart.current;
     const writePos=Math.round((elapsedMs/1000)*SR);
 
-    // Send samples to worklet
     playNode.current.port.postMessage({type:'samples',buf:f32.buffer,pos:writePos},[f32.buffer]);
     totalWritten.current=writePos+f32.length;
 
-    // Start playback after BUF_SEC seconds of data
+    // Start playback after BUF_SEC seconds of data accumulated
     if(!started.current && totalWritten.current>=SR*BUF_SEC){
       started.current=true;
-      // Calculate read position: we want to read from BUF_SEC ago
-      // readPos = 0 means "the beginning of the stream"
-      // We want all devices to read the same position at the same server time
-      // readPos at serverNow = (serverNow - firstChunkTime - BUF_SEC*1000) / 1000 * SR
+      // ALL devices calculate the same read position from the same streamStart
       const serverNow=ck.current?.now()||Date.now();
-      const rPos=Math.max(0,Math.round(((serverNow-firstChunkTime.current)/1000-BUF_SEC)*SR));
+      const rPos=Math.max(0,Math.round(((serverNow-streamStart.current)/1000-BUF_SEC)*SR));
       playNode.current.port.postMessage({type:'start',rPos});
       setPlaying(true);
     }
@@ -283,9 +272,9 @@ function Listener({roomCode,userName,onLeave}){
       }
       const m=JSON.parse(e.data);
       if(m.type==="welcome"){ck.current=new Clock(o=>w.readyState===1&&w.send(JSON.stringify(o)));w.send(JSON.stringify({type:"join",room:roomCode,name:userName}));}
-      if(m.type==="joined"){setJoined(true);setHost(m.host);setLive(m.live);ck.current?.ping();si.current=setInterval(()=>{ck.current?.ping();setRtt(ck.current?.rtt||null);setOff(ck.current?.off||null);},2000);await initPlayback();}
+      if(m.type==="joined"){setJoined(true);setHost(m.host);setLive(m.live);if(m.streamStart)streamStart.current=m.streamStart;ck.current?.ping();si.current=setInterval(()=>{ck.current?.ping();setRtt(ck.current?.rtt||null);setOff(ck.current?.off||null);},2000);await initPlayback();}
       if(m.type==="sync-pong"){ck.current?.pong(m);setRtt(ck.current?.rtt||null);setOff(ck.current?.off||null);}
-      if(m.type==="host-live"){setLive(m.live);if(!m.live){setPlaying(false);started.current=false;firstChunkTime.current=null;totalWritten.current=0;}}
+      if(m.type==="host-live"){setLive(m.live);if(m.live&&m.streamStart){streamStart.current=m.streamStart;}if(!m.live){setPlaying(false);started.current=false;streamStart.current=null;totalWritten.current=0;}}
       if(m.type==="closed"){setErr("Room closed.");setPlaying(false);}
       if(m.type==="error")setErr(m.msg);
     };
