@@ -43,11 +43,10 @@ const { useState, useRef, useEffect, useCallback } = React;
 //  CONFIG — Change this to your Render.com server URL
 // ═══════════════════════════════════════════════════
 const CONFIG = {
-  // When running locally:  ws://localhost:8080/ws
-  // When deployed on Render: wss://your-app-name.onrender.com/ws
-  WS_URL: window.location.hostname === "localhost"
-    ? "ws://localhost:8080/ws"
-    : "wss://djlab-sync.onrender.com/ws",
+  // Automatically connects to whatever server the page is hosted on
+  WS_URL: window.location.protocol === "https:"
+    ? `wss://${window.location.host}/ws`
+    : `ws://${window.location.host}/ws`,
 
   // STUN/TURN servers for WebRTC
   ICE_SERVERS: [
