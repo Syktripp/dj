@@ -87,8 +87,9 @@ wss.on("connection", ws => {
         const p = peers.get(ws); if (!p || p.role !== "host") return;
         const rm = rooms.get(p.room); if (!rm) return;
         rm.live = m.live;
-        if (!m.live) rm.buf = new RingBuffer();
-        for (const [lw] of rm.ls) sj(lw, { type: "host-live", live: m.live, sr: rm.sr });
+        if (m.live) { rm.streamStart = Date.now(); rm.buf = new RingBuffer(); }
+        else { rm.streamStart = null; rm.buf = new RingBuffer(); }
+        for (const [lw] of rm.ls) sj(lw, { type: "host-live", live: m.live, sr: rm.sr, streamStart: rm.streamStart });
         break;
       }
       case "join": {
@@ -97,7 +98,7 @@ wss.on("connection", ws => {
         const p = peers.get(ws);
         p.room = m.room; p.role = "listener";
         rm.ls.set(ws, { id: p.id, name: m.name || "Listener" });
-        sj(ws, { type: "joined", room: m.room, host: rm.hn, live: rm.live, sr: rm.sr, n: rm.ls.size, t: Date.now() });
+        sj(ws, { type: "joined", room: m.room, host: rm.hn, live: rm.live, sr: rm.sr, n: rm.ls.size, t: Date.now(), streamStart: rm.streamStart || null });
         sj(rm.hw, { type: "l+", id: p.id, name: m.name, n: rm.ls.size });
         // Send recent buffer for instant start
         if (rm.live) {
