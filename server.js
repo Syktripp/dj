@@ -1,14 +1,14 @@
 /**
- * DJ Lab Sync Server v4
- * - Binary PCM chunk relay with server timestamps
- * - NTP clock sync
- * - streamStart shared across all listeners (sync anchor)
- * - Chat room
- * - Version indicator
+ * DJ Lab Sync Server v5.0
+ * 
+ * No rooms. One server = one session.
+ * - Host broadcasts PCM chunks via WebSocket (binary)
+ * - Server timestamps + relays to all listeners
+ * - NTP clock sync for all devices
+ * - Chat
  */
 
-const VERSION = "v4.0";
-
+const VERSION = "v5.0";
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -17,25 +17,26 @@ const { WebSocketServer } = require("ws");
 const PORT = process.env.PORT || 8080;
 const PUBLIC_DIR = path.join(__dirname, "public");
 
-class RingBuffer {
-  constructor(max = 1500) { this.max = max; this.chunks = []; }
-  push(c) { this.chunks.push(c); if (this.chunks.length > this.max) this.chunks.shift(); }
-  getRecent(sec) { const t = Date.now() - sec * 1000; return this.chunks.filter(c => c.t >= t); }
-}
+// ─── Global State (one session, no rooms) ───
+let hostWs = null;
+let hostName = "";
+let isLive = false;
+let streamStart = null;
+let sampleRate = 48000;
+const listeners = new Map(); // ws → {id, name}
+const chatLog = [];
+let seqN = 0;
+let peerN = 0;
 
-const rooms = new Map();
-const peers = new Map();
-let peerN = 0, seqN = 0;
+// Ring buffer for late joiners
+const MAX_CHUNKS = 1500;
+const audioBuffer = [];
+function pushChunk(c) { audioBuffer.push(c); if (audioBuffer.length > MAX_CHUNKS) audioBuffer.shift(); }
+function recentChunks(sec) { const t = Date.now() - sec * 1000; return audioBuffer.filter(c => c.t >= t); }
 
 function gid() { return `p${++peerN}`; }
-function groom() {
-  const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let r = ""; for (let i = 0; i < 5; i++) r += c[Math.floor(Math.random() * c.length)];
-  return rooms.has(r) ? groom() : r;
-}
 function sj(ws, m) { if (ws.readyState === 1) ws.send(JSON.stringify(m)); }
 
-// Binary chunk: [4B seq uint32LE][8B serverTime float64LE][PCM data]
 function packChunk(seq, t, pcm) {
   const h = Buffer.alloc(12);
   h.writeUInt32LE(seq, 0);
@@ -43,14 +44,21 @@ function packChunk(seq, t, pcm) {
   return Buffer.concat([h, Buffer.from(pcm)]);
 }
 
-// HTTP
+function broadcastJSON(msg, exclude) {
+  if (hostWs && hostWs !== exclude && hostWs.readyState === 1) sj(hostWs, msg);
+  for (const [ws] of listeners) { if (ws !== exclude && ws.readyState === 1) sj(ws, msg); }
+}
+
+// ─── HTTP ───
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
   if (req.url === "/health") {
-    let n = 0; for (const r of rooms.values()) n += r.ls.size;
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, version: VERSION, rooms: rooms.size, listeners: n, up: Math.floor(process.uptime()) }));
+    res.end(JSON.stringify({
+      ok: true, version: VERSION, live: isLive, host: hostName || null,
+      listeners: listeners.size, uptime: Math.floor(process.uptime()),
+    }));
     return;
   }
   const fp = (req.url.split("?")[0] === "/" ? "/index.html" : req.url.split("?")[0]);
@@ -61,160 +69,129 @@ const server = http.createServer((req, res) => {
   res.writeHead(404); res.end("Not found");
 });
 
-// WebSocket
+// ─── WebSocket ───
 const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 512 * 1024 });
 
 wss.on("connection", ws => {
   const id = gid();
-  peers.set(ws, { id, room: null, role: null, name: "anon" });
-  sj(ws, { type: "welcome", id, t: Date.now(), version: VERSION });
+  const peer = { id, role: null, name: "anon" };
+  ws._peer = peer;
+
+  sj(ws, {
+    type: "welcome", id, t: Date.now(), version: VERSION,
+    live: isLive, host: hostName, streamStart,
+    chatHistory: chatLog.slice(-50),
+    listenerCount: listeners.size,
+  });
 
   ws.on("message", (raw, bin) => {
-    // Binary = audio chunk from host
+    // Binary = audio from host
     if (bin) {
-      const p = peers.get(ws);
-      if (!p || p.role !== "host") return;
-      const rm = rooms.get(p.room);
-      if (!rm || !rm.live) return;
+      if (ws !== hostWs || !isLive) return;
       const seq = ++seqN, t = Date.now();
       const packed = packChunk(seq, t, raw);
-      rm.buf.push({ seq, t, d: raw });
-      for (const [lw] of rm.ls) { if (lw.readyState === 1) lw.send(packed, { binary: true }); }
+      pushChunk({ seq, t, d: raw });
+      for (const [lw] of listeners) { if (lw.readyState === 1) lw.send(packed, { binary: true }); }
       return;
     }
 
     let m; try { m = JSON.parse(raw); } catch { return; }
 
     switch (m.type) {
-      case "create-room": {
-        const p = peers.get(ws);
-        const rc = groom();
-        p.name = m.name || "Host";
-        rooms.set(rc, {
-          hw: ws, hn: p.name, ls: new Map(), buf: new RingBuffer(),
-          t0: Date.now(), live: false, streamStart: null, sr: m.sr || 48000,
-          chat: [],
-        });
-        p.room = rc; p.role = "host";
-        sj(ws, { type: "room-created", room: rc, t: Date.now(), version: VERSION });
-        console.log(`[${VERSION}] Room ${rc} created`);
+      // Become the host
+      case "host": {
+        if (hostWs && hostWs !== ws && hostWs.readyState === 1) {
+          sj(ws, { type: "error", msg: "Someone is already hosting." });
+          return;
+        }
+        peer.role = "host";
+        peer.name = m.name || "DJ";
+        hostWs = ws;
+        hostName = peer.name;
+        listeners.delete(ws); // host isn't a listener
+        broadcastJSON({ type: "host-changed", host: hostName });
+        sj(ws, { type: "host-ok", version: VERSION });
+        console.log(`[${VERSION}] Host: ${hostName}`);
         break;
       }
 
-      case "host-live": {
-        const p = peers.get(ws);
-        if (!p || p.role !== "host") return;
-        const rm = rooms.get(p.room);
-        if (!rm) return;
+      // Start/stop broadcasting
+      case "live": {
+        if (ws !== hostWs) return;
         if (m.live) {
-          rm.live = true;
-          rm.streamStart = Date.now();
-          rm.buf = new RingBuffer();
+          isLive = true;
+          streamStart = Date.now();
+          audioBuffer.length = 0;
+          seqN = 0;
+          sampleRate = m.sr || 48000;
         } else {
-          rm.live = false;
-          rm.streamStart = null;
-          rm.buf = new RingBuffer();
+          isLive = false;
+          streamStart = null;
+          audioBuffer.length = 0;
         }
-        // Broadcast to ALL listeners
-        for (const [lw] of rm.ls) {
-          sj(lw, { type: "host-live", live: rm.live, sr: rm.sr, streamStart: rm.streamStart });
-        }
-        console.log(`[${VERSION}] Room ${p.room} streaming: ${rm.live}`);
+        broadcastJSON({ type: "live", live: isLive, streamStart, sr: sampleRate });
+        console.log(`[${VERSION}] Live: ${isLive}`);
         break;
       }
 
-      case "join": {
-        const rm = rooms.get(m.room);
-        if (!rm) { sj(ws, { type: "error", msg: "Room not found", code: "NO_ROOM" }); return; }
-        const p = peers.get(ws);
-        p.name = m.name || "Listener";
-        p.room = m.room; p.role = "listener";
-        rm.ls.set(ws, { id: p.id, name: p.name });
+      // Join as listener
+      case "listen": {
+        peer.role = "listener";
+        peer.name = m.name || "Listener";
+        listeners.set(ws, { id, name: peer.name });
         sj(ws, {
-          type: "joined", room: m.room, host: rm.hn, live: rm.live,
-          sr: rm.sr, n: rm.ls.size, t: Date.now(),
-          streamStart: rm.streamStart, version: VERSION,
-          // Send recent chat history
-          chatHistory: rm.chat.slice(-50),
+          type: "listen-ok", version: VERSION, live: isLive, host: hostName,
+          streamStart, sr: sampleRate, n: listeners.size, t: Date.now(),
+          chatHistory: chatLog.slice(-50),
         });
-        sj(rm.hw, { type: "l+", id: p.id, name: p.name, n: rm.ls.size });
-
-        // Broadcast join to other listeners
-        for (const [lw] of rm.ls) {
-          if (lw !== ws) sj(lw, { type: "l+", id: p.id, name: p.name, n: rm.ls.size });
-        }
-
-        // Send recent audio buffer for instant start
-        if (rm.live) {
-          const recent = rm.buf.getRecent(10);
+        broadcastJSON({ type: "l+", id, name: peer.name, n: listeners.size }, ws);
+        // Send recent audio for instant start
+        if (isLive) {
+          const recent = recentChunks(10);
           for (const ch of recent) {
             const pk = packChunk(ch.seq, ch.t, ch.d);
             if (ws.readyState === 1) ws.send(pk, { binary: true });
           }
         }
-        console.log(`[${VERSION}] Room ${m.room} +${p.name} (${rm.ls.size} listeners)`);
+        console.log(`[${VERSION}] +${peer.name} (${listeners.size})`);
         break;
       }
 
+      // Chat
       case "chat": {
-        const p = peers.get(ws);
-        if (!p || !p.room) return;
-        const rm = rooms.get(p.room);
-        if (!rm) return;
-        const msg = { from: p.name, text: (m.text || "").slice(0, 500), t: Date.now() };
-        rm.chat.push(msg);
-        if (rm.chat.length > 200) rm.chat.shift();
-        // Broadcast to host + all listeners
-        sj(rm.hw, { type: "chat", ...msg });
-        for (const [lw] of rm.ls) sj(lw, { type: "chat", ...msg });
+        const msg = { from: peer.name, text: (m.text || "").slice(0, 500), t: Date.now() };
+        chatLog.push(msg);
+        if (chatLog.length > 200) chatLog.shift();
+        broadcastJSON({ type: "chat", ...msg });
         break;
       }
 
+      // NTP sync
       case "sync-ping": {
         sj(ws, { type: "sync-pong", id: m.id, ct: m.ct, t: Date.now() });
-        break;
-      }
-
-      case "leave": {
-        cleanup(ws);
-        sj(ws, { type: "left" });
         break;
       }
     }
   });
 
-  ws.on("close", () => cleanup(ws));
-  ws.on("error", () => cleanup(ws));
+  ws.on("close", () => {
+    if (ws === hostWs) {
+      hostWs = null; isLive = false; streamStart = null;
+      hostName = "";
+      audioBuffer.length = 0;
+      broadcastJSON({ type: "host-gone" });
+      console.log(`[${VERSION}] Host disconnected`);
+    } else {
+      listeners.delete(ws);
+      broadcastJSON({ type: "l-", id: peer.id, name: peer.name, n: listeners.size });
+    }
+  });
+
+  ws.on("error", () => {});
 });
 
-function cleanup(ws) {
-  const p = peers.get(ws);
-  if (!p || !p.room) { peers.delete(ws); return; }
-  const rm = rooms.get(p.room);
-  if (!rm) { peers.delete(ws); return; }
-  if (p.role === "host") {
-    for (const [lw] of rm.ls) sj(lw, { type: "closed", why: "Host left" });
-    rooms.delete(p.room);
-    console.log(`[${VERSION}] Room ${p.room} closed`);
-  } else {
-    rm.ls.delete(ws);
-    if (rm.hw.readyState === 1) sj(rm.hw, { type: "l-", id: p.id, name: p.name, n: rm.ls.size });
-    for (const [lw] of rm.ls) sj(lw, { type: "l-", id: p.id, name: p.name, n: rm.ls.size });
-  }
-  peers.delete(ws);
-}
-
-setInterval(() => {
-  for (const [c, r] of rooms) {
-    if (Date.now() - r.t0 > 8 * 3600000) {
-      for (const [lw] of r.ls) sj(lw, { type: "closed", why: "Expired" });
-      rooms.delete(c);
-    }
-  }
-}, 300000);
-
 server.listen(PORT, () => {
-  console.log(`\n🎧 DJ Lab Sync Server ${VERSION}`);
+  console.log(`\n🎧 DJ Lab Sync ${VERSION}`);
   console.log(`   Port: ${PORT}`);
   console.log(`   Health: http://localhost:${PORT}/health\n`);
 });
