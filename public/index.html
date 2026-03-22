@@ -259,7 +259,7 @@ function LandingPage({ onHost, onJoin }) {
 // ══════════════════════════════════════════
 //   HOST VIEW — Captures audio, streams via WebRTC
 // ══════════════════════════════════════════
-function HostView({ roomCode, userName, onLeave }) {
+function HostView({ roomCode: initialRoomCode, userName, onLeave }) {
   const [devices,setDevices]=useState([]);
   const [selectedDevice,setSelectedDevice]=useState("");
   const [captureMode,setCaptureMode]=useState("device");
@@ -267,8 +267,9 @@ function HostView({ roomCode, userName, onLeave }) {
   const [monitorOn,setMonitorOn]=useState(false);
   const [error,setError]=useState(null);
   const [elapsed,setElapsed]=useState(0);
-  const [wsStatus,setWsStatus]=useState("connecting"); // connecting, connected, error
-  const [listeners,setListeners]=useState([]); // [{peerId, name, rtt}]
+  const [wsStatus,setWsStatus]=useState("connecting");
+  const [listeners,setListeners]=useState([]);
+  const [roomCode,setRoomCode]=useState(initialRoomCode || "...");
   const [,forceUpdate]=useState(0);
 
   const wsRef = useRef(null);
@@ -335,6 +336,7 @@ function HostView({ roomCode, userName, onLeave }) {
 
       case "room-created":
         console.log("[Room] Created:", msg.roomCode);
+        setRoomCode(msg.roomCode);
         // Start clock sync pings
         clockSyncRef.current?.ping();
         syncIntervalRef.current = setInterval(() => clockSyncRef.current?.ping(), 3000);
@@ -885,19 +887,13 @@ function ListenerView({ roomCode, userName, onLeave }) {
 //   APP ROOT
 // ══════════════════════════════
 function App() {
-  const [view,setView]=useState("landing");
-  const [roomCode,setRoomCode]=useState("");
-  const [userName,setUserName]=useState("");
+  // Check URL params BEFORE first render
+  const urlParams = new URLSearchParams(window.location.search);
+  const urlRoom = urlParams.get("room");
 
-  // Check for ?room= param on load
-  useEffect(()=>{
-    const p=new URLSearchParams(window.location.search);
-    const r=p.get("room");
-    if(r) {
-      // Auto-join mode (from QR code)
-      setRoomCode(r.toUpperCase());
-    }
-  },[]);
+  const [view,setView]=useState(urlRoom ? "listener" : "landing");
+  const [roomCode,setRoomCode]=useState(urlRoom ? urlRoom.toUpperCase() : "");
+  const [userName,setUserName]=useState(generateName);
 
   return (<>
     {view==="landing"&&<LandingPage
