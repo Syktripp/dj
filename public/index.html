@@ -271,6 +271,7 @@ function HostView({ roomCode: initialRoomCode, userName, onLeave }) {
   const [listeners,setListeners]=useState([]);
   const [roomCode,setRoomCode]=useState(initialRoomCode || "...");
   const [,forceUpdate]=useState(0);
+  const listenersRef = useRef([]);
 
   const wsRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -348,7 +349,11 @@ function HostView({ roomCode: initialRoomCode, userName, onLeave }) {
 
       case "peer-joined":
         console.log("[Room] Peer joined:", msg.peerId, msg.name);
-        setListeners(prev => [...prev, { peerId: msg.peerId, name: msg.name, rtt: 0, status: "connecting" }]);
+        setListeners(prev => {
+          const updated = [...prev, { peerId: msg.peerId, name: msg.name, rtt: 0, status: "connecting" }];
+          listenersRef.current = updated;
+          return updated;
+        });
         // If we're capturing, create a WebRTC connection to this peer
         if (streamRef.current) {
           createPeerConnection(msg.peerId);
@@ -357,7 +362,11 @@ function HostView({ roomCode: initialRoomCode, userName, onLeave }) {
 
       case "peer-left":
         console.log("[Room] Peer left:", msg.peerId);
-        setListeners(prev => prev.filter(l => l.peerId !== msg.peerId));
+        setListeners(prev => {
+          const updated = prev.filter(l => l.peerId !== msg.peerId);
+          listenersRef.current = updated;
+          return updated;
+        });
         // Clean up peer connection
         const pc = peerConnectionsRef.current.get(msg.peerId);
         if (pc) { pc.close(); peerConnectionsRef.current.delete(msg.peerId); }
@@ -503,10 +512,13 @@ function HostView({ roomCode: initialRoomCode, userName, onLeave }) {
       forceUpdate(n => n + 1);
 
       // Create WebRTC connections to any existing listeners
-      for (const listener of listeners) {
-        if (!peerConnectionsRef.current.has(listener.peerId)) {
-          createPeerConnection(listener.peerId);
-        }
+      // Close old connections first, then recreate with fresh audio tracks
+      for (const [pid, oldPc] of peerConnectionsRef.current) {
+        oldPc.close();
+      }
+      peerConnectionsRef.current.clear();
+      for (const listener of listenersRef.current) {
+        createPeerConnection(listener.peerId);
       }
 
       stream.getTracks().forEach(track => { track.onended = () => stopCapture(); });
@@ -673,10 +685,11 @@ function ListenerView({ roomCode, userName, onLeave }) {
   const [volume,setVolume]=useState(85);
   const [latency,setLatency]=useState(null);
   const [error,setError]=useState(null);
+  const [audioUnlocked,setAudioUnlocked]=useState(false);
 
   const wsRef=useRef(null);
   const pcRef=useRef(null);
-  const audioRef=useRef(null);
+  const audioElRef=useRef(null);
   const gainRef=useRef(null);
   const audioCtxRef=useRef(null);
   const analyserRef=useRef(null);
@@ -684,6 +697,7 @@ function ListenerView({ roomCode, userName, onLeave }) {
   const hostIdRef=useRef(null);
   const clockSyncRef=useRef(null);
   const syncIntervalRef=useRef(null);
+  const remoteStreamRef=useRef(null);
   const [,forceUpdate]=useState(0);
 
   useEffect(() => {
@@ -759,23 +773,31 @@ function ListenerView({ roomCode, userName, onLeave }) {
 
     pc.ontrack = (e) => {
       console.log("[WebRTC] Received audio track!");
-      // Create audio context for volume control + visualization
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      audioCtxRef.current = ctx;
+      remoteStreamRef.current = e.streams[0];
 
-      const source = ctx.createMediaStreamSource(e.streams[0]);
-      const gain = ctx.createGain();
-      gain.gain.value = volume / 100;
-      gainRef.current = gain;
+      // Use <audio> element for reliable mobile playback
+      if (!audioElRef.current) {
+        const audio = document.createElement("audio");
+        audio.autoplay = true;
+        audio.playsInline = true;
+        audio.setAttribute("playsinline", "");
+        audioElRef.current = audio;
+      }
+      audioElRef.current.srcObject = e.streams[0];
+      audioElRef.current.volume = volume / 100;
 
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 2048;
-      analyser.smoothingTimeConstant = 0.8;
-      analyserRef.current = analyser;
-
-      source.connect(gain);
-      gain.connect(analyser);
-      analyser.connect(ctx.destination);
+      // Try to play immediately — may fail on mobile without user gesture
+      const playPromise = audioElRef.current.play();
+      if (playPromise) {
+        playPromise.then(() => {
+          console.log("[Audio] Playing!");
+          setAudioUnlocked(true);
+          setupVisualizer(e.streams[0]);
+        }).catch((err) => {
+          console.log("[Audio] Blocked, needs tap:", err.message);
+          setAudioUnlocked(false);
+        });
+      }
 
       setRtcStatus("connected");
       forceUpdate(n => n + 1);
@@ -803,14 +825,46 @@ function ListenerView({ roomCode, userName, onLeave }) {
     try { await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e) {}
   }
 
-  // Volume control
+  function setupVisualizer(stream) {
+    try {
+      if (audioCtxRef.current) return; // already set up
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      audioCtxRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.8;
+      analyserRef.current = analyser;
+      source.connect(analyser);
+      // Don't connect to destination — <audio> element handles playback
+      forceUpdate(n => n + 1);
+    } catch(e) { console.log("Visualizer setup:", e); }
+  }
+
+  function unlockAudio() {
+    if (audioElRef.current) {
+      audioElRef.current.play().then(() => {
+        console.log("[Audio] Unlocked by tap!");
+        setAudioUnlocked(true);
+        if (remoteStreamRef.current) setupVisualizer(remoteStreamRef.current);
+      }).catch(e => console.error("[Audio] Still blocked:", e));
+    }
+    // Also resume AudioContext if it exists
+    if (audioCtxRef.current && audioCtxRef.current.state === "suspended") {
+      audioCtxRef.current.resume();
+    }
+  }
+
+  // Volume control — use audio element
   useEffect(() => {
-    if (gainRef.current) gainRef.current.gain.value = volume / 100;
+    if (audioElRef.current) audioElRef.current.volume = volume / 100;
   }, [volume]);
 
   function handleLeave() {
     wsSend({ type: "leave-room" });
     if (pcRef.current) pcRef.current.close();
+    if (audioElRef.current) { audioElRef.current.pause(); audioElRef.current.srcObject = null; }
+    if (audioCtxRef.current) audioCtxRef.current.close().catch(()=>{});
     onLeave();
   }
 
@@ -847,6 +901,18 @@ function ListenerView({ roomCode, userName, onLeave }) {
               <p style={{fontSize:12,color:"#64748b",marginBottom:4}}>Now listening to</p>
               <p style={{fontSize:18,fontWeight:700}}>{hostName}</p>
             </div>
+
+            {/* Tap to unlock audio on mobile */}
+            {!audioUnlocked && (
+              <button onClick={unlockAudio} style={{
+                width:"100%",padding:"18px",borderRadius:12,border:"2px solid "+S.accent,
+                background:"rgba(6,214,160,0.1)",color:S.accent,fontSize:16,fontWeight:700,
+                fontFamily:S.font,cursor:"pointer",marginBottom:16,
+                animation:"pulse-dot 2s ease infinite",
+              }}>
+                🔊 Tap to Start Listening
+              </button>
+            )}
 
             {/* Live waveform from incoming stream */}
             <div style={{marginBottom:16}}>
