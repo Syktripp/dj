@@ -8,7 +8,7 @@
  * - Chat
  */
 
-const VERSION = "v5.0";
+const VERSION = "v5.1";
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
