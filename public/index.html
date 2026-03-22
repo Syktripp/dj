@@ -1,0 +1,916 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DJ Lab Sync</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>
+  *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+  html, body, #root { height:100%; width:100%; }
+  body { background:#08090d; overflow-x:hidden; }
+  ::selection { background:rgba(6,214,160,0.3); }
+  input[type="range"] { -webkit-appearance:none; appearance:none; height:4px; background:rgba(255,255,255,0.08); border-radius:2px; outline:none; }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance:none; width:14px; height:14px; border-radius:50%; background:#06d6a0; cursor:pointer; border:2px solid #08090d; }
+  select option { background:#1a1d27; color:#e0e4ec; }
+  @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  @keyframes spin { to{transform:rotate(360deg)} }
+  @keyframes bar-bounce { 0%{transform:scaleY(0.3)} 100%{transform:scaleY(1)} }
+  @keyframes fade-in { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  .fade-in { animation:fade-in 0.4s ease both; }
+  .fade-in-d1 { animation-delay:0.05s; }
+  .fade-in-d2 { animation-delay:0.1s; }
+  ::-webkit-scrollbar { width:6px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  ::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.08); border-radius:3px; }
+  @media (max-width:768px) {
+    .host-grid { grid-template-columns:1fr !important; }
+    .room-sidebar { order:-1; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+// ═══════════════════════════════════════════════════
+//  CONFIG — Change this to your Render.com server URL
+// ═══════════════════════════════════════════════════
+const CONFIG = {
+  // When running locally:  ws://localhost:8080/ws
+  // When deployed on Render: wss://your-app-name.onrender.com/ws
+  WS_URL: window.location.hostname === "localhost"
+    ? "ws://localhost:8080/ws"
+    : "wss://djlab-sync.onrender.com/ws",
+
+  // STUN/TURN servers for WebRTC
+  ICE_SERVERS: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+  ],
+};
+
+// ─── Helpers ───
+const ADJECTIVES = ["cosmic","neon","solar","lunar","crystal","shadow","golden","velvet","arctic","ember","azure","crimson","jade","amber","violet","coral","phantom","electric","silent","turbo"];
+const NOUNS = ["bass","kick","snare","reverb","echo","pulse","drop","groove","tempo","vinyl","filter","synth","delay","loop","pitch","phase","wave","tone","beat","fader"];
+function generateName() {
+  return ADJECTIVES[Math.floor(Math.random()*ADJECTIVES.length)] + "-" + NOUNS[Math.floor(Math.random()*NOUNS.length)];
+}
+function formatTime(s) {
+  if(!isFinite(s)||isNaN(s)) return "0:00";
+  return `${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,"0")}`;
+}
+
+// ─── Shared Styles ───
+const S = {
+  font:"'Outfit', sans-serif", mono:"'JetBrains Mono', monospace",
+  accent:"#06d6a0", accentDim:"rgba(6,214,160,0.15)", accentGlow:"0 0 30px rgba(6,214,160,0.25)",
+  glass: { background:"rgba(255,255,255,0.02)", border:"1px solid rgba(255,255,255,0.06)", borderRadius:14, backdropFilter:"blur(20px)", WebkitBackdropFilter:"blur(20px)" },
+};
+
+// ─── NTP Clock Sync ───
+class ClockSync {
+  constructor(wsSend) {
+    this.wsSend = wsSend;
+    this.offset = 0;
+    this.rtt = 0;
+    this.samples = [];
+    this.maxSamples = 8;
+  }
+  ping() {
+    this.wsSend({ type: "sync-ping", clientSendTime: Date.now() });
+  }
+  handlePong(msg) {
+    const clientReceiveTime = Date.now();
+    const rtt = clientReceiveTime - msg.clientSendTime;
+    const offset = msg.serverTime - msg.clientSendTime - rtt / 2;
+    this.samples.push({ offset, rtt });
+    if (this.samples.length > this.maxSamples) this.samples.shift();
+    // Use median offset for stability
+    const sorted = [...this.samples].sort((a,b) => a.offset - b.offset);
+    this.offset = sorted[Math.floor(sorted.length / 2)].offset;
+    this.rtt = rtt;
+  }
+  serverNow() { return Date.now() + this.offset; }
+}
+
+// ─── Reusable Components ───
+function AmbientBG() {
+  return (<>
+    <div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0,opacity:0.03,backgroundImage:`url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`}}/>
+    <div style={{position:"fixed",top:"-40%",left:"-20%",width:"80%",height:"80%",background:"radial-gradient(circle, rgba(6,214,160,0.04) 0%, transparent 65%)",filter:"blur(100px)",pointerEvents:"none",zIndex:0}}/>
+    <div style={{position:"fixed",bottom:"-30%",right:"-15%",width:"70%",height:"70%",background:"radial-gradient(circle, rgba(6,182,212,0.03) 0%, transparent 65%)",filter:"blur(100px)",pointerEvents:"none",zIndex:0}}/>
+  </>);
+}
+
+function Logo({ size="md" }) {
+  const sz = size==="lg"?42:32, fs = size==="lg"?28:20;
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:10}}>
+      <div style={{width:sz,height:sz,borderRadius:10,background:`linear-gradient(135deg, ${S.accent}, #06b6d4)`,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:S.accentGlow}}>
+        <svg width={sz*0.5} height={sz*0.5} viewBox="0 0 24 24" fill="none" stroke="#08090d" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      </div>
+      <div>
+        <span style={{fontSize:fs,fontWeight:700,letterSpacing:"-0.04em",background:"linear-gradient(135deg, #e0e4ec, #94a3b8)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>DJ Lab</span>
+        <span style={{fontSize:fs,fontWeight:300,letterSpacing:"-0.02em",color:S.accent,marginLeft:6}}>Sync</span>
+      </div>
+    </div>
+  );
+}
+
+function Btn({ children, variant="primary", onClick, disabled, style:sx, ...rest }) {
+  const base = {padding:"11px 22px",borderRadius:10,border:"none",fontFamily:S.font,fontWeight:600,fontSize:13,cursor:disabled?"not-allowed":"pointer",transition:"all 0.2s ease",display:"inline-flex",alignItems:"center",gap:8,opacity:disabled?0.4:1};
+  const vars = {
+    primary:{background:`linear-gradient(135deg, ${S.accent}, #06b6d4)`,color:"#08090d",boxShadow:"0 4px 20px rgba(6,214,160,0.25)"},
+    secondary:{background:"rgba(255,255,255,0.05)",color:"#94a3b8",border:"1px solid rgba(255,255,255,0.08)"},
+    danger:{background:"rgba(239,68,68,0.15)",color:"#ef4444",border:"1px solid rgba(239,68,68,0.2)"},
+  };
+  return <button onClick={onClick} disabled={disabled} style={{...base,...vars[variant],...sx}} {...rest}>{children}</button>;
+}
+
+function StatusPill({ status, label }) {
+  const c = {live:{bg:"rgba(6,214,160,0.12)",fg:S.accent,dot:S.accent},idle:{bg:"rgba(255,255,255,0.04)",fg:"#64748b",dot:"#475569"},connecting:{bg:"rgba(245,158,11,0.12)",fg:"#f59e0b",dot:"#f59e0b"},error:{bg:"rgba(239,68,68,0.12)",fg:"#ef4444",dot:"#ef4444"}}[status]||{bg:"rgba(255,255,255,0.04)",fg:"#64748b",dot:"#475569"};
+  return (<div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 12px",borderRadius:20,background:c.bg,fontSize:12,fontWeight:500,color:c.fg}}>
+    <div style={{width:6,height:6,borderRadius:"50%",background:c.dot,animation:status==="live"?"pulse-dot 2s ease infinite":"none"}}/>
+    {label}
+  </div>);
+}
+
+function WaveformVisualizer({ analyser, isActive, height=140 }) {
+  const canvasRef = useRef(null);
+  const animRef = useRef(null);
+  useEffect(() => {
+    const canvas = canvasRef.current; if(!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio||1;
+    function resize() { const r=canvas.getBoundingClientRect(); canvas.width=r.width*dpr; canvas.height=r.height*dpr; ctx.setTransform(dpr,0,0,dpr,0,0); }
+    resize(); window.addEventListener("resize",resize);
+    function draw() {
+      animRef.current = requestAnimationFrame(draw);
+      const r=canvas.getBoundingClientRect(), w=r.width, h=r.height;
+      ctx.clearRect(0,0,w,h);
+      if(!analyser||!isActive) {
+        ctx.strokeStyle="rgba(6,214,160,0.15)"; ctx.lineWidth=1.5; ctx.beginPath();
+        const t=Date.now()/1000;
+        for(let x=0;x<w;x++){const y=h/2+Math.sin((x/w)*6+t*2)*2; x===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}
+        ctx.stroke(); return;
+      }
+      const bufLen=analyser.frequencyBinCount, freqData=new Uint8Array(bufLen);
+      analyser.getByteFrequencyData(freqData);
+      const barCount=Math.min(100,Math.floor(w/6)), barW=w/barCount, gap=2;
+      for(let i=0;i<barCount;i++){
+        const idx=Math.floor(Math.pow(i/barCount,1.5)*bufLen*0.6);
+        const val=freqData[idx]/255, barH=Math.max(2,val*h*0.9);
+        const grad=ctx.createLinearGradient(0,h,0,h-barH);
+        grad.addColorStop(0,"rgba(6,214,160,0.7)"); grad.addColorStop(0.4,"rgba(6,182,212,0.5)"); grad.addColorStop(1,"rgba(6,214,160,0.05)");
+        ctx.fillStyle=grad;
+        const x=i*barW+gap/2, bw=barW-gap, r2=Math.min(2,bw/2);
+        ctx.beginPath(); ctx.moveTo(x+r2,h-barH); ctx.lineTo(x+bw-r2,h-barH); ctx.quadraticCurveTo(x+bw,h-barH,x+bw,h-barH+r2); ctx.lineTo(x+bw,h); ctx.lineTo(x,h); ctx.lineTo(x,h-barH+r2); ctx.quadraticCurveTo(x,h-barH,x+r2,h-barH); ctx.fill();
+      }
+      const timeData=new Uint8Array(bufLen); analyser.getByteTimeDomainData(timeData);
+      ctx.strokeStyle="rgba(6,214,160,0.3)"; ctx.lineWidth=1.5; ctx.beginPath();
+      for(let i=0;i<bufLen;i++){const x=(i/bufLen)*w, y=(timeData[i]/255)*h; i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}
+      ctx.stroke();
+    }
+    draw();
+    return()=>{cancelAnimationFrame(animRef.current);window.removeEventListener("resize",resize);};
+  },[analyser,isActive]);
+  return <canvas ref={canvasRef} style={{width:"100%",height,borderRadius:10,background:"rgba(0,0,0,0.3)",display:"block"}}/>;
+}
+
+function VolumeMeter({ analyser, isActive }) {
+  const [level,setLevel]=useState(0); const rafRef=useRef(null);
+  useEffect(()=>{
+    if(!analyser||!isActive){setLevel(0);return;}
+    const data=new Uint8Array(analyser.frequencyBinCount);
+    function tick(){rafRef.current=requestAnimationFrame(tick);analyser.getByteFrequencyData(data);let s=0;for(let i=0;i<data.length;i++)s+=data[i];setLevel(s/data.length/255);}
+    tick(); return()=>cancelAnimationFrame(rafRef.current);
+  },[analyser,isActive]);
+  const db=level>0?Math.max(-60,20*Math.log10(level)):-60;
+  const pct=Math.max(0,(db+60)/60*100);
+  return (<div style={{display:"flex",alignItems:"center",gap:10,fontSize:12}}>
+    <span style={{color:"#64748b",fontFamily:S.mono,minWidth:50,fontSize:11}}>{level>0.001?`${db.toFixed(0)} dB`:"— dB"}</span>
+    <div style={{flex:1,height:6,background:"rgba(255,255,255,0.05)",borderRadius:3,overflow:"hidden"}}>
+      <div style={{width:`${pct}%`,height:"100%",borderRadius:3,transition:"width 0.08s linear",background:pct>85?"linear-gradient(90deg, #06d6a0, #f59e0b, #ef4444)":pct>50?"linear-gradient(90deg, #06d6a0, #06b6d4)":S.accent}}/>
+    </div>
+  </div>);
+}
+
+
+// ══════════════════════════════════════════
+//   LANDING PAGE
+// ══════════════════════════════════════════
+function LandingPage({ onHost, onJoin }) {
+  const [roomCode,setRoomCode]=useState("");
+  const [userName]=useState(generateName);
+  // Check URL params for room code
+  useEffect(()=>{
+    const p=new URLSearchParams(window.location.search);
+    const r=p.get("room");
+    if(r){setRoomCode(r.toUpperCase());}
+  },[]);
+
+  return (
+    <div style={{fontFamily:S.font,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:20,position:"relative",overflow:"hidden"}}>
+      <AmbientBG/>
+      <div style={{position:"relative",zIndex:1,textAlign:"center",maxWidth:440,width:"100%"}}>
+        <div className="fade-in" style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(6,214,160,0.08)",border:"1px solid rgba(6,214,160,0.15)",borderRadius:20,padding:"6px 16px",fontSize:12,color:S.accent,marginBottom:28,fontWeight:500}}>
+          <span style={{fontSize:10}}>●</span> Multi-Device Audio Sync
+        </div>
+        <div className="fade-in fade-in-d1"><Logo size="lg"/></div>
+        <p className="fade-in fade-in-d1" style={{color:"#64748b",fontSize:14,lineHeight:1.6,marginTop:12,marginBottom:36}}>
+          Turn every device into a synchronized speaker.<br/>Capture live audio and stream it to every phone in the room.
+        </p>
+
+        <div className="fade-in fade-in-d1" style={{...S.glass,padding:"28px 24px",marginBottom:16,textAlign:"left"}}>
+          <h3 style={{fontSize:15,fontWeight:600,marginBottom:4}}>🎧 Host a Session</h3>
+          <p style={{fontSize:12,color:"#64748b",marginBottom:18,lineHeight:1.5}}>Capture audio from your DJM-A9 or any audio source and stream it to connected devices.</p>
+          <Btn onClick={()=>onHost(userName)} style={{width:"100%",justifyContent:"center"}}>Create Room &amp; Start Broadcasting</Btn>
+        </div>
+
+        <div className="fade-in fade-in-d2" style={{...S.glass,padding:"28px 24px",textAlign:"left"}}>
+          <h3 style={{fontSize:15,fontWeight:600,marginBottom:4}}>📱 Join a Room</h3>
+          <p style={{fontSize:12,color:"#64748b",marginBottom:14,lineHeight:1.5}}>Enter a room code to listen in sync with everyone else.</p>
+          <div style={{display:"flex",gap:10}}>
+            <input value={roomCode} onChange={e=>setRoomCode(e.target.value.toUpperCase())} placeholder="Room code..." maxLength={5}
+              style={{flex:1,padding:"10px 14px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#e0e4ec",fontSize:15,fontFamily:S.mono,fontWeight:600,letterSpacing:"0.2em",outline:"none",textAlign:"center"}}
+              onFocus={e=>e.target.style.borderColor="rgba(6,214,160,0.4)"} onBlur={e=>e.target.style.borderColor="rgba(255,255,255,0.08)"}
+              onKeyDown={e=>{if(e.key==="Enter"&&roomCode.length>=3)onJoin(roomCode,userName);}}
+            />
+            <Btn onClick={()=>roomCode.length>=3&&onJoin(roomCode,userName)} disabled={roomCode.length<3}>Join</Btn>
+          </div>
+          <div style={{marginTop:12,fontSize:12,color:"#475569",display:"flex",alignItems:"center",gap:6}}>
+            Joining as <span style={{fontFamily:S.mono,fontSize:11,fontWeight:500,background:S.accentDim,color:S.accent,padding:"2px 8px",borderRadius:4}}>{userName}</span>
+          </div>
+        </div>
+        <p style={{marginTop:24,fontSize:11,color:"#334155"}}>Built for The DJ Lab · thedjlab.ca</p>
+      </div>
+    </div>
+  );
+}
+
+
+// ══════════════════════════════════════════
+//   HOST VIEW — Captures audio, streams via WebRTC
+// ══════════════════════════════════════════
+function HostView({ roomCode, userName, onLeave }) {
+  const [devices,setDevices]=useState([]);
+  const [selectedDevice,setSelectedDevice]=useState("");
+  const [captureMode,setCaptureMode]=useState("device");
+  const [isCapturing,setIsCapturing]=useState(false);
+  const [monitorOn,setMonitorOn]=useState(false);
+  const [error,setError]=useState(null);
+  const [elapsed,setElapsed]=useState(0);
+  const [wsStatus,setWsStatus]=useState("connecting"); // connecting, connected, error
+  const [listeners,setListeners]=useState([]); // [{peerId, name, rtt}]
+  const [,forceUpdate]=useState(0);
+
+  const wsRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const analyserRef = useRef(null);
+  const sourceRef = useRef(null);
+  const streamRef = useRef(null);
+  const startTimeRef = useRef(null);
+  const timerRef = useRef(null);
+  const myPeerIdRef = useRef(null);
+  const peerConnectionsRef = useRef(new Map()); // peerId → RTCPeerConnection
+  const clockSyncRef = useRef(null);
+  const syncIntervalRef = useRef(null);
+
+  // ─── WebSocket Connection ───
+  useEffect(() => {
+    const ws = new WebSocket(CONFIG.WS_URL);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log("[WS] Connected");
+      setWsStatus("connected");
+    };
+
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      handleServerMessage(msg);
+    };
+
+    ws.onerror = (e) => {
+      console.error("[WS] Error:", e);
+      setWsStatus("error");
+    };
+
+    ws.onclose = () => {
+      console.log("[WS] Closed");
+      setWsStatus("error");
+    };
+
+    return () => {
+      ws.close();
+      clearInterval(syncIntervalRef.current);
+      // Close all peer connections
+      for (const pc of peerConnectionsRef.current.values()) pc.close();
+      peerConnectionsRef.current.clear();
+    };
+  }, []);
+
+  function wsSend(msg) {
+    if (wsRef.current?.readyState === 1) {
+      wsRef.current.send(JSON.stringify(msg));
+    }
+  }
+
+  function handleServerMessage(msg) {
+    switch (msg.type) {
+      case "welcome":
+        myPeerIdRef.current = msg.peerId;
+        // Create clock sync
+        clockSyncRef.current = new ClockSync(wsSend);
+        // Create room
+        wsSend({ type: "create-room", name: userName });
+        break;
+
+      case "room-created":
+        console.log("[Room] Created:", msg.roomCode);
+        // Start clock sync pings
+        clockSyncRef.current?.ping();
+        syncIntervalRef.current = setInterval(() => clockSyncRef.current?.ping(), 3000);
+        break;
+
+      case "sync-pong":
+        clockSyncRef.current?.handlePong(msg);
+        break;
+
+      case "peer-joined":
+        console.log("[Room] Peer joined:", msg.peerId, msg.name);
+        setListeners(prev => [...prev, { peerId: msg.peerId, name: msg.name, rtt: 0, status: "connecting" }]);
+        // If we're capturing, create a WebRTC connection to this peer
+        if (streamRef.current) {
+          createPeerConnection(msg.peerId);
+        }
+        break;
+
+      case "peer-left":
+        console.log("[Room] Peer left:", msg.peerId);
+        setListeners(prev => prev.filter(l => l.peerId !== msg.peerId));
+        // Clean up peer connection
+        const pc = peerConnectionsRef.current.get(msg.peerId);
+        if (pc) { pc.close(); peerConnectionsRef.current.delete(msg.peerId); }
+        break;
+
+      case "answer":
+        handleAnswer(msg.fromId, msg.sdp);
+        break;
+
+      case "ice-candidate":
+        handleRemoteIceCandidate(msg.fromId, msg.candidate);
+        break;
+
+      case "error":
+        console.error("[Server Error]", msg.message);
+        if (msg.code === "ROOM_NOT_FOUND") setError("Room not found");
+        break;
+    }
+  }
+
+  // ─── WebRTC: Host creates connection to each listener ───
+  async function createPeerConnection(targetPeerId) {
+    const pc = new RTCPeerConnection({ iceServers: CONFIG.ICE_SERVERS });
+    peerConnectionsRef.current.set(targetPeerId, pc);
+
+    // Add audio tracks from our capture stream
+    if (streamRef.current) {
+      for (const track of streamRef.current.getAudioTracks()) {
+        pc.addTrack(track, streamRef.current);
+      }
+    }
+
+    // ICE candidates → send to peer via server
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        wsSend({ type: "ice-candidate", targetId: targetPeerId, candidate: e.candidate });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log(`[WebRTC → ${targetPeerId}] State: ${pc.connectionState}`);
+      setListeners(prev => prev.map(l =>
+        l.peerId === targetPeerId ? { ...l, status: pc.connectionState } : l
+      ));
+    };
+
+    // Create and send offer
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      wsSend({ type: "offer", targetId: targetPeerId, sdp: pc.localDescription });
+      console.log(`[WebRTC] Sent offer to ${targetPeerId}`);
+    } catch (err) {
+      console.error("[WebRTC] Offer error:", err);
+    }
+  }
+
+  async function handleAnswer(fromId, sdp) {
+    const pc = peerConnectionsRef.current.get(fromId);
+    if (!pc) return;
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      console.log(`[WebRTC] Set answer from ${fromId}`);
+    } catch (err) {
+      console.error("[WebRTC] Answer error:", err);
+    }
+  }
+
+  async function handleRemoteIceCandidate(fromId, candidate) {
+    const pc = peerConnectionsRef.current.get(fromId);
+    if (!pc) return;
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+      console.error("[WebRTC] ICE error:", err);
+    }
+  }
+
+  // ─── Device Enumeration ───
+  useEffect(() => {
+    async function init() {
+      try {
+        const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+        tmp.getTracks().forEach(t => t.stop());
+        const all = await navigator.mediaDevices.enumerateDevices();
+        setDevices(all.filter(d => d.kind === "audioinput"));
+      } catch (e) { console.log("Device enum:", e); }
+    }
+    init();
+    return () => stopCapture();
+  }, []);
+
+  // ─── Timer ───
+  useEffect(() => {
+    if (isCapturing) {
+      startTimeRef.current = Date.now();
+      timerRef.current = setInterval(() => setElapsed(Math.floor((Date.now() - startTimeRef.current) / 1000)), 1000);
+    } else { clearInterval(timerRef.current); setElapsed(0); }
+    return () => clearInterval(timerRef.current);
+  }, [isCapturing]);
+
+  // ─── Monitor Toggle ───
+  useEffect(() => {
+    if (!audioCtxRef.current || !sourceRef.current) return;
+    try {
+      if (monitorOn) sourceRef.current.connect(audioCtxRef.current.destination);
+      else sourceRef.current.disconnect(audioCtxRef.current.destination);
+    } catch (e) {}
+  }, [monitorOn]);
+
+  // ─── Audio Capture ───
+  async function startCapture() {
+    setError(null);
+    try {
+      let stream;
+      if (captureMode === "system") {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { width: 1, height: 1 },
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000 },
+        });
+        if (!stream.getAudioTracks().length) {
+          stream.getTracks().forEach(t => t.stop());
+          setError("No audio track. Check 'Share audio' in the dialog. Share a Chrome Tab for best results.");
+          return;
+        }
+        stream.getVideoTracks().forEach(t => t.stop());
+      } else {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { deviceId: selectedDevice ? { exact: selectedDevice } : undefined, echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000, channelCount: 2 },
+        });
+      }
+
+      streamRef.current = stream;
+      const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+      audioCtxRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      sourceRef.current = source;
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.8;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+      setIsCapturing(true);
+      forceUpdate(n => n + 1);
+
+      // Create WebRTC connections to any existing listeners
+      for (const listener of listeners) {
+        if (!peerConnectionsRef.current.has(listener.peerId)) {
+          createPeerConnection(listener.peerId);
+        }
+      }
+
+      stream.getTracks().forEach(track => { track.onended = () => stopCapture(); });
+    } catch (err) {
+      if (err.name === "NotAllowedError") setError("Permission denied. Please allow audio access.");
+      else if (err.name === "NotFoundError") setError("No audio device found.");
+      else setError("Failed: " + err.message);
+    }
+  }
+
+  function stopCapture() {
+    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
+    analyserRef.current = null; sourceRef.current = null;
+    setIsCapturing(false); setMonitorOn(false);
+    forceUpdate(n => n + 1);
+  }
+
+  function handleLeave() {
+    stopCapture();
+    wsSend({ type: "leave-room" });
+    for (const pc of peerConnectionsRef.current.values()) pc.close();
+    peerConnectionsRef.current.clear();
+    onLeave();
+  }
+
+  const qrData = encodeURIComponent(`${window.location.origin}${window.location.pathname}?room=${roomCode}`);
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${qrData}&bgcolor=08090d&color=06d6a0&format=svg`;
+
+  return (
+    <div style={{fontFamily:S.font,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",position:"relative",overflow:"hidden"}}>
+      <AmbientBG/>
+      <div style={{position:"relative",zIndex:1,maxWidth:960,margin:"0 auto",padding:"20px 20px 40px"}}>
+
+        {/* Header */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24,flexWrap:"wrap",gap:12}}>
+          <Logo/>
+          <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            <StatusPill status={wsStatus==="connected"?(isCapturing?"live":"idle"):"connecting"}
+              label={wsStatus!=="connected"?"Connecting to server...":(isCapturing?`LIVE · ${formatTime(elapsed)}`:"Ready")} />
+            <Btn variant="danger" onClick={handleLeave} style={{padding:"8px 14px",fontSize:12}}>Leave</Btn>
+          </div>
+        </div>
+
+        {/* Server error banner */}
+        {wsStatus === "error" && (
+          <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.15)",marginBottom:16,fontSize:13,color:"#fca5a5",lineHeight:1.5}}>
+            ⚠️ Could not connect to sync server. Audio capture still works locally — but listeners won't be able to connect. Make sure the server is running.
+          </div>
+        )}
+
+        <div className="host-grid" style={{display:"grid",gridTemplateColumns:"1fr 300px",gap:20,alignItems:"start"}}>
+          {/* Left */}
+          <div style={{display:"flex",flexDirection:"column",gap:16}}>
+
+            {/* Audio Source */}
+            <div className="fade-in" style={{...S.glass,padding:"22px 20px"}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:8}}>
+                <h3 style={{fontSize:14,fontWeight:600,margin:0}}>Audio Source</h3>
+                <div style={{display:"flex",background:"rgba(255,255,255,0.04)",borderRadius:8,overflow:"hidden",border:"1px solid rgba(255,255,255,0.06)"}}>
+                  {[{key:"device",label:"🎛 Audio Device"},{key:"system",label:"🖥 System Audio"}].map(m=>(
+                    <button key={m.key} onClick={()=>!isCapturing&&setCaptureMode(m.key)} style={{padding:"6px 14px",border:"none",fontSize:12,fontWeight:500,fontFamily:S.font,cursor:isCapturing?"not-allowed":"pointer",background:captureMode===m.key?S.accentDim:"transparent",color:captureMode===m.key?S.accent:"#64748b",transition:"all 0.2s"}}>{m.label}</button>
+                  ))}
+                </div>
+              </div>
+              {captureMode==="device"?(
+                <div style={{marginBottom:14}}>
+                  <select value={selectedDevice} onChange={e=>setSelectedDevice(e.target.value)} style={{width:"100%",padding:"10px 14px",borderRadius:8,background:"rgba(255,255,255,0.04)",color:"#e0e4ec",border:"1px solid rgba(255,255,255,0.08)",fontSize:13,fontFamily:S.font,outline:"none",cursor:"pointer",appearance:"none",backgroundImage:`url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E")`,backgroundRepeat:"no-repeat",backgroundPosition:"right 12px center"}}>
+                    <option value="">Select audio source...</option>
+                    {devices.map(d=><option key={d.deviceId} value={d.deviceId}>{d.label||`Device ${d.deviceId.slice(0,8)}`}</option>)}
+                  </select>
+                  <p style={{fontSize:11,color:"#475569",marginTop:8,lineHeight:1.5}}>Your DJM-A9 appears here as a USB audio device.</p>
+                </div>
+              ):(
+                <div style={{padding:"14px 16px",borderRadius:8,background:"rgba(6,214,160,0.05)",border:"1px solid rgba(6,214,160,0.1)",marginBottom:14}}>
+                  <p style={{fontSize:12,color:"#94a3b8",lineHeight:1.6,margin:0}}><strong style={{color:S.accent}}>System Audio Capture</strong><br/>Chrome will ask you to share a screen or tab. Share a <strong>Chrome Tab</strong> and check <strong>"Also share tab audio"</strong>.</p>
+                </div>
+              )}
+              <div style={{display:"flex",gap:10}}>
+                {!isCapturing
+                  ? <Btn onClick={startCapture} style={{flex:1,justifyContent:"center"}}>▶ Start Capturing</Btn>
+                  : <Btn variant="danger" onClick={stopCapture} style={{flex:1,justifyContent:"center"}}>⏹ Stop</Btn>}
+              </div>
+              {error&&<div style={{marginTop:12,padding:"10px 14px",borderRadius:8,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.15)",fontSize:12,color:"#fca5a5",lineHeight:1.5}}>{error}</div>}
+            </div>
+
+            {/* Waveform */}
+            <div className="fade-in fade-in-d1" style={{...S.glass,padding:"18px 18px 14px"}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+                <h3 style={{fontSize:14,fontWeight:600,margin:0}}>{isCapturing?"Live Audio":"Audio Preview"}</h3>
+                {isCapturing&&<div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:S.accent,fontFamily:S.mono}}>
+                  <div style={{width:5,height:5,borderRadius:"50%",background:S.accent,animation:"pulse-dot 1.5s ease infinite"}}/>48kHz · Stereo</div>}
+              </div>
+              <WaveformVisualizer analyser={analyserRef.current} isActive={isCapturing} height={140}/>
+              <div style={{marginTop:10}}><VolumeMeter analyser={analyserRef.current} isActive={isCapturing}/></div>
+            </div>
+          </div>
+
+          {/* Right — Room Info */}
+          <div className="room-sidebar" style={{display:"flex",flexDirection:"column",gap:16}}>
+            <div className="fade-in" style={{...S.glass,padding:"22px 20px",textAlign:"center"}}>
+              <p style={{fontSize:11,color:"#64748b",marginBottom:6,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:600}}>Room Code</p>
+              <div style={{fontSize:36,fontWeight:800,letterSpacing:"0.15em",fontFamily:S.mono,color:S.accent,textShadow:"0 0 30px rgba(6,214,160,0.3)",marginBottom:16}}>{roomCode}</div>
+              <div style={{width:160,height:160,margin:"0 auto 12px",background:"#0d1117",borderRadius:12,padding:10,border:"1px solid rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                <img src={qrUrl} alt="QR" style={{width:140,height:140,borderRadius:6}} onError={e=>{e.target.style.display="none"}}/>
+              </div>
+              <p style={{fontSize:11,color:"#475569"}}>Scan with phone camera to join</p>
+              <div style={{marginTop:10,padding:"8px 12px",borderRadius:8,background:"rgba(255,255,255,0.03)",fontSize:10,color:"#64748b",fontFamily:S.mono,wordBreak:"break-all"}}>
+                {window.location.origin}{window.location.pathname}?room={roomCode}
+              </div>
+            </div>
+
+            {/* Listeners */}
+            <div className="fade-in fade-in-d1" style={{...S.glass,padding:"18px 16px"}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+                <h3 style={{fontSize:14,fontWeight:600,margin:0}}>Listeners</h3>
+                <span style={{fontSize:11,fontFamily:S.mono,color:S.accent,background:S.accentDim,padding:"2px 8px",borderRadius:4}}>{listeners.length}</span>
+              </div>
+              {listeners.length === 0 ? (
+                <p style={{fontSize:12,color:"#475569",textAlign:"center",padding:"16px 0",fontStyle:"italic"}}>
+                  Waiting for listeners to join...
+                </p>
+              ) : (
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  {listeners.map(l => (
+                    <div key={l.peerId} style={{...S.glass,padding:"10px 14px",display:"flex",alignItems:"center",gap:10}}>
+                      <span style={{fontSize:18}}>📱</span>
+                      <div style={{flex:1}}>
+                        <div style={{fontSize:13,fontWeight:500}}>{l.name}</div>
+                        <div style={{fontSize:10,color:l.status==="connected"?S.accent:l.status==="connecting"?"#f59e0b":"#64748b",fontFamily:S.mono}}>
+                          {l.status==="connected"?"● streaming":l.status==="connecting"?"○ connecting":"○ "+l.status}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Monitor */}
+            <div className="fade-in fade-in-d2" style={{...S.glass,padding:"14px 16px",cursor:isCapturing?"pointer":"default"}} onClick={()=>isCapturing&&setMonitorOn(!monitorOn)}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                <div><div style={{fontSize:13,fontWeight:500}}>Local Monitor</div><div style={{fontSize:11,color:"#64748b"}}>Hear audio on this device</div></div>
+                <div style={{width:40,height:22,borderRadius:11,background:monitorOn?"rgba(6,214,160,0.3)":"rgba(255,255,255,0.08)",position:"relative",transition:"background 0.2s"}}>
+                  <div style={{width:16,height:16,borderRadius:"50%",position:"absolute",top:3,left:monitorOn?21:3,transition:"all 0.2s",background:monitorOn?S.accent:"#475569"}}/>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ══════════════════════════════════════════
+//   LISTENER VIEW — Receives audio via WebRTC
+// ══════════════════════════════════════════
+function ListenerView({ roomCode, userName, onLeave }) {
+  const [wsStatus,setWsStatus]=useState("connecting");
+  const [rtcStatus,setRtcStatus]=useState("waiting"); // waiting, connecting, connected, failed
+  const [hostName,setHostName]=useState("Host");
+  const [volume,setVolume]=useState(85);
+  const [latency,setLatency]=useState(null);
+  const [error,setError]=useState(null);
+
+  const wsRef=useRef(null);
+  const pcRef=useRef(null);
+  const audioRef=useRef(null);
+  const gainRef=useRef(null);
+  const audioCtxRef=useRef(null);
+  const analyserRef=useRef(null);
+  const myPeerIdRef=useRef(null);
+  const hostIdRef=useRef(null);
+  const clockSyncRef=useRef(null);
+  const syncIntervalRef=useRef(null);
+  const [,forceUpdate]=useState(0);
+
+  useEffect(() => {
+    const ws = new WebSocket(CONFIG.WS_URL);
+    wsRef.current = ws;
+
+    ws.onopen = () => { setWsStatus("connected"); };
+    ws.onerror = () => { setWsStatus("error"); setError("Could not connect to server."); };
+    ws.onclose = () => { setWsStatus("error"); };
+
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      switch (msg.type) {
+        case "welcome":
+          myPeerIdRef.current = msg.peerId;
+          clockSyncRef.current = new ClockSync((m) => ws.readyState===1 && ws.send(JSON.stringify(m)));
+          ws.send(JSON.stringify({ type: "join-room", roomCode, name: userName }));
+          break;
+
+        case "room-joined":
+          hostIdRef.current = msg.hostId;
+          const host = msg.peers.find(p => p.isHost);
+          if (host) setHostName(host.name);
+          clockSyncRef.current?.ping();
+          syncIntervalRef.current = setInterval(() => clockSyncRef.current?.ping(), 3000);
+          setRtcStatus("waiting");
+          break;
+
+        case "sync-pong":
+          clockSyncRef.current?.handlePong(msg);
+          setLatency(clockSyncRef.current?.rtt || null);
+          break;
+
+        case "offer":
+          handleOffer(msg.fromId, msg.sdp);
+          break;
+
+        case "ice-candidate":
+          handleIce(msg.fromId, msg.candidate);
+          break;
+
+        case "room-closed":
+          setError("Room was closed by the host.");
+          setRtcStatus("failed");
+          break;
+
+        case "error":
+          if (msg.code === "ROOM_NOT_FOUND") setError("Room not found. Check the code and try again.");
+          else setError(msg.message);
+          break;
+      }
+    };
+
+    return () => {
+      ws.close();
+      clearInterval(syncIntervalRef.current);
+      if (pcRef.current) pcRef.current.close();
+    };
+  }, []);
+
+  function wsSend(msg) {
+    if (wsRef.current?.readyState===1) wsRef.current.send(JSON.stringify(msg));
+  }
+
+  async function handleOffer(fromId, sdp) {
+    setRtcStatus("connecting");
+    const pc = new RTCPeerConnection({ iceServers: CONFIG.ICE_SERVERS });
+    pcRef.current = pc;
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) wsSend({ type: "ice-candidate", targetId: fromId, candidate: e.candidate });
+    };
+
+    pc.ontrack = (e) => {
+      console.log("[WebRTC] Received audio track!");
+      // Create audio context for volume control + visualization
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      audioCtxRef.current = ctx;
+
+      const source = ctx.createMediaStreamSource(e.streams[0]);
+      const gain = ctx.createGain();
+      gain.gain.value = volume / 100;
+      gainRef.current = gain;
+
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.8;
+      analyserRef.current = analyser;
+
+      source.connect(gain);
+      gain.connect(analyser);
+      analyser.connect(ctx.destination);
+
+      setRtcStatus("connected");
+      forceUpdate(n => n + 1);
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log("[WebRTC Listener] State:", pc.connectionState);
+      if (pc.connectionState === "connected") setRtcStatus("connected");
+      if (pc.connectionState === "failed" || pc.connectionState === "disconnected") setRtcStatus("failed");
+    };
+
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      wsSend({ type: "answer", targetId: fromId, sdp: pc.localDescription });
+    } catch (err) {
+      console.error("[WebRTC] Answer error:", err);
+      setRtcStatus("failed");
+    }
+  }
+
+  async function handleIce(fromId, candidate) {
+    if (!pcRef.current) return;
+    try { await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e) {}
+  }
+
+  // Volume control
+  useEffect(() => {
+    if (gainRef.current) gainRef.current.gain.value = volume / 100;
+  }, [volume]);
+
+  function handleLeave() {
+    wsSend({ type: "leave-room" });
+    if (pcRef.current) pcRef.current.close();
+    onLeave();
+  }
+
+  const isStreaming = rtcStatus === "connected";
+
+  return (
+    <div style={{fontFamily:S.font,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,position:"relative",overflow:"hidden"}}>
+      <AmbientBG/>
+      <div style={{position:"relative",zIndex:1,maxWidth:420,width:"100%",textAlign:"center"}}>
+        <Logo/>
+
+        <div className="fade-in" style={{...S.glass,padding:"28px 24px",marginTop:24,textAlign:"left"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+            <StatusPill status={isStreaming?"live":rtcStatus==="failed"?"error":wsStatus==="error"?"error":"connecting"}
+              label={isStreaming?"Streaming":rtcStatus==="failed"?"Disconnected":wsStatus==="error"?"Server Error":"Connecting..."}/>
+            <span style={{fontFamily:S.mono,fontSize:14,fontWeight:600,color:S.accent,letterSpacing:"0.1em"}}>{roomCode}</span>
+          </div>
+
+          {error && (
+            <div style={{padding:"12px 14px",borderRadius:8,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.15)",fontSize:12,color:"#fca5a5",lineHeight:1.5,marginBottom:16}}>{error}</div>
+          )}
+
+          {!isStreaming && !error && (
+            <div style={{textAlign:"center",padding:"30px 0"}}>
+              <div style={{width:40,height:40,border:"3px solid rgba(6,214,160,0.2)",borderTopColor:S.accent,borderRadius:"50%",animation:"spin 0.8s linear infinite",margin:"0 auto 16px"}}/>
+              <p style={{fontSize:13,color:"#64748b"}}>
+                {wsStatus!=="connected"?"Connecting to server...":rtcStatus==="waiting"?"Waiting for host to start streaming...":"Establishing audio connection..."}
+              </p>
+            </div>
+          )}
+
+          {isStreaming && (<>
+            <div style={{textAlign:"center",padding:"20px 0 16px",borderBottom:"1px solid rgba(255,255,255,0.05)",marginBottom:16}}>
+              <p style={{fontSize:12,color:"#64748b",marginBottom:4}}>Now listening to</p>
+              <p style={{fontSize:18,fontWeight:700}}>{hostName}</p>
+            </div>
+
+            {/* Live waveform from incoming stream */}
+            <div style={{marginBottom:16}}>
+              <WaveformVisualizer analyser={analyserRef.current} isActive={true} height={80}/>
+            </div>
+
+            <div style={{marginTop:4}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+                <span style={{fontSize:12,color:"#64748b"}}>Volume</span>
+                <span style={{fontSize:11,fontFamily:S.mono,color:"#94a3b8"}}>{volume}%</span>
+              </div>
+              <input type="range" min="0" max="100" value={volume} onChange={e=>setVolume(Number(e.target.value))} style={{width:"100%"}}/>
+            </div>
+
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:16}}>
+              <div style={{textAlign:"center",padding:"10px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}>
+                <div style={{fontSize:18,fontWeight:700,color:S.accent,fontFamily:S.mono}}>{latency ? `${latency}ms` : "—"}</div>
+                <div style={{fontSize:10,color:"#64748b"}}>Round-trip</div>
+              </div>
+              <div style={{textAlign:"center",padding:"10px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}>
+                <div style={{fontSize:18,fontWeight:700,color:S.accent,fontFamily:S.mono}}>
+                  {clockSyncRef.current ? `±${Math.abs(Math.round(clockSyncRef.current.offset))}ms` : "—"}
+                </div>
+                <div style={{fontSize:10,color:"#64748b"}}>Clock Offset</div>
+              </div>
+            </div>
+          </>)}
+
+          <Btn variant="secondary" onClick={handleLeave} style={{width:"100%",justifyContent:"center",marginTop:18}}>Leave Room</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ══════════════════════════════
+//   APP ROOT
+// ══════════════════════════════
+function App() {
+  const [view,setView]=useState("landing");
+  const [roomCode,setRoomCode]=useState("");
+  const [userName,setUserName]=useState("");
+
+  // Check for ?room= param on load
+  useEffect(()=>{
+    const p=new URLSearchParams(window.location.search);
+    const r=p.get("room");
+    if(r) {
+      // Auto-join mode (from QR code)
+      setRoomCode(r.toUpperCase());
+    }
+  },[]);
+
+  return (<>
+    {view==="landing"&&<LandingPage
+      onHost={(name)=>{setUserName(name);setRoomCode("");setView("host");}}
+      onJoin={(code,name)=>{setUserName(name);setRoomCode(code);setView("listener");}}
+    />}
+    {view==="host"&&<HostView roomCode={roomCode} userName={userName} onLeave={()=>{setView("landing");setRoomCode("");window.history.replaceState({},"",window.location.pathname);}}/>}
+    {view==="listener"&&<ListenerView roomCode={roomCode} userName={userName} onLeave={()=>{setView("landing");setRoomCode("");window.history.replaceState({},"",window.location.pathname);}}/>}
+  </>);
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
