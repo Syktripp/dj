@@ -19,20 +19,18 @@ select option{background:#1a1d27;color:#e0e4ec}@keyframes pd{0%,100%{opacity:1}5
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script type="text/babel">
 const{useState,useRef,useEffect}=React;
-
-const CLIENT_VERSION="v4.0";
+const VER="v5.0";
 const WS=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";
 const SR=48000;
-const CHUNK=8192;          // capture chunk size (~170ms)
-const BUF_SEC=5;           // sync buffer delay in seconds
-const RING_SECS=60;        // ring buffer duration
-const RING_LEN=SR*RING_SECS;
-const SCHED_INTERVAL=400;  // how often scheduler runs (ms)
-const BLOCK_SEC=1.5;       // how much audio per scheduled block
-const BLOCK_SAMPLES=Math.floor(SR*BLOCK_SEC);
-const FADE=64;             // crossfade samples at block edges
+const CHUNK=8192;
+const BUF_SEC=5;
+const RING_LEN=SR*60;
+const SCHED_MS=400;
+const BLOCK_SEC=1.5;
+const BLOCK_N=Math.floor(SR*BLOCK_SEC);
+const FADE=64;
 
-// ══════════ NTP CLOCK (Beatsync-style: 40 samples, best-RTT average) ══════════
+// ══════ NTP CLOCK ══════
 class Clock{
   constructor(fn){this.fn=fn;this.s=[];this.offset=0;this.rtt=0;this.n=0;this.ready=false;}
   ping(){this.fn({type:"sync-ping",id:++this.n,ct:Date.now()});}
@@ -48,335 +46,345 @@ class Clock{
   now(){return Date.now()+this.offset;}
 }
 
-// ══════════ CAPTURE WORKLET CODE (host side) ══════════
+// ══════ CAPTURE WORKLET ══════
 const CAP_CODE=`class C extends AudioWorkletProcessor{constructor(o){super();this.sz=o.processorOptions.sz||8192;this.b=new Float32Array(this.sz);this.p=0;}process(ins){const i=ins[0];if(!i||!i[0])return true;const L=i[0],R=i.length>1&&i[1]?i[1]:L;for(let j=0;j<L.length;j++){this.b[this.p++]=(L[j]+R[j])*0.5;if(this.p>=this.sz){const o=new Int16Array(this.sz);for(let k=0;k<this.sz;k++)o[k]=Math.max(-32768,Math.min(32767,Math.round(this.b[k]*32767)));this.port.postMessage(o.buffer,[o.buffer]);this.p=0;}}return true;}}registerProcessor('cap',C);`;
-function mkURL(code){return URL.createObjectURL(new Blob([code],{type:"application/javascript"}));}
+function mkURL(c){return URL.createObjectURL(new Blob([c],{type:"application/javascript"}));}
 
-// ══════════ CHUNK PROTOCOL ══════════
-// [4B seq uint32LE][8B serverTime float64LE][rest: Int16 PCM]
-function unpack(buf){const d=new DataView(buf);return{seq:d.getUint32(0,true),t:d.getFloat64(4,true),pcm:new Int16Array(buf,12)};}
-function i16f32(i16){const f=new Float32Array(i16.length);for(let j=0;j<i16.length;j++)f[j]=i16[j]/32768;return f;}
+// ══════ CHUNK PROTOCOL ══════
+function unpack(b){const d=new DataView(b);return{seq:d.getUint32(0,true),t:d.getFloat64(4,true),pcm:new Int16Array(b,12)};}
+function i2f(i){const f=new Float32Array(i.length);for(let j=0;j<i.length;j++)f[j]=i[j]/32768;return f;}
 
-// ══════════ STYLES ══════════
+// ══════ STYLES ══════
 const S={f:"'Outfit',sans-serif",m:"'JetBrains Mono',monospace",a:"#06d6a0",d:"rgba(6,214,160,0.15)",
-  g:{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:14,backdropFilter:"blur(20px)",WebkitBackdropFilter:"blur(20px)"}};
+  g:{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:14,backdropFilter:"blur(20px)"}};
 const AD=["cosmic","neon","solar","lunar","crystal","shadow","golden","velvet","arctic","ember","azure","crimson","jade","amber","violet","coral","phantom","electric","turbo","silent"];
 const NO=["bass","kick","snare","reverb","echo","pulse","drop","groove","tempo","vinyl","synth","delay","loop","pitch","wave","beat","fader","filter","tone","phase"];
 function gn(){return AD[Math.floor(Math.random()*AD.length)]+"-"+NO[Math.floor(Math.random()*NO.length)];}
 function ft(s){if(!isFinite(s))return"0:00";return`${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,"0")}`;}
 function fmtT(ts){const d=new Date(ts);return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');}
 
-// ══════════ SHARED UI COMPONENTS ══════════
-function BG(){return(<><div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0,opacity:0.03,backgroundImage:`url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`}}/><div style={{position:"fixed",top:"-40%",left:"-20%",width:"80%",height:"80%",background:"radial-gradient(circle,rgba(6,214,160,0.04) 0%,transparent 65%)",filter:"blur(100px)",pointerEvents:"none",zIndex:0}}/></>);}
-function Logo({big}){const z=big?42:32,f=big?28:20;return(<div style={{display:"flex",alignItems:"center",gap:10,justifyContent:big?"center":"flex-start"}}><div style={{width:z,height:z,borderRadius:10,background:`linear-gradient(135deg,${S.a},#06b6d4)`,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 0 30px rgba(6,214,160,0.25)"}}><svg width={z*.5} height={z*.5} viewBox="0 0 24 24" fill="none" stroke="#08090d" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div><div><span style={{fontSize:f,fontWeight:700,letterSpacing:"-0.04em",background:"linear-gradient(135deg,#e0e4ec,#94a3b8)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>DJ Lab</span><span style={{fontSize:f,fontWeight:300,color:S.a,marginLeft:6}}>Sync</span></div></div>);}
+// ══════ UI ══════
+function BG(){return<div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0}}><div style={{position:"absolute",inset:0,opacity:0.03,backgroundImage:`url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`}}/><div style={{position:"absolute",top:"-40%",left:"-20%",width:"80%",height:"80%",background:"radial-gradient(circle,rgba(6,214,160,0.04) 0%,transparent 65%)",filter:"blur(100px)"}}/></div>;}
+function Logo(){return<div style={{display:"flex",alignItems:"center",gap:10}}><div style={{width:32,height:32,borderRadius:10,background:`linear-gradient(135deg,${S.a},#06b6d4)`,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 0 30px rgba(6,214,160,0.25)"}}><svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="#08090d" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div><span style={{fontSize:20,fontWeight:700,letterSpacing:"-0.04em",background:"linear-gradient(135deg,#e0e4ec,#94a3b8)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>DJ Lab</span><span style={{fontSize:20,fontWeight:300,color:S.a}}>Sync</span></div>;}
 function Btn({children,v="primary",onClick,disabled,style:sx,...r}){const b={padding:"11px 22px",borderRadius:10,border:"none",fontFamily:S.f,fontWeight:600,fontSize:13,cursor:disabled?"not-allowed":"pointer",transition:"all 0.2s",display:"inline-flex",alignItems:"center",gap:8,opacity:disabled?0.4:1};const vs={primary:{background:`linear-gradient(135deg,${S.a},#06b6d4)`,color:"#08090d",boxShadow:"0 4px 20px rgba(6,214,160,0.25)"},secondary:{background:"rgba(255,255,255,0.05)",color:"#94a3b8",border:"1px solid rgba(255,255,255,0.08)"},danger:{background:"rgba(239,68,68,0.15)",color:"#ef4444",border:"1px solid rgba(239,68,68,0.2)"}};return<button onClick={onClick} disabled={disabled} style={{...b,...vs[v],...sx}} {...r}>{children}</button>;}
-function Pill({s,label}){const c={live:{bg:"rgba(6,214,160,0.12)",fg:S.a},idle:{bg:"rgba(255,255,255,0.04)",fg:"#64748b"},connecting:{bg:"rgba(245,158,11,0.12)",fg:"#f59e0b"},error:{bg:"rgba(239,68,68,0.12)",fg:"#ef4444"}}[s]||{bg:"rgba(255,255,255,0.04)",fg:"#64748b"};return(<div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 12px",borderRadius:20,background:c.bg,fontSize:12,fontWeight:500,color:c.fg}}><div style={{width:6,height:6,borderRadius:"50%",background:c.fg,animation:s==="live"?"pd 2s ease infinite":"none"}}/>{label}</div>);}
-function VerBadge({v}){return <span style={{fontSize:9,fontFamily:S.m,color:"#334155",background:"rgba(255,255,255,0.03)",padding:"2px 6px",borderRadius:4}}>{v||CLIENT_VERSION}</span>;}
+function Pill({s,label}){const c={live:{bg:"rgba(6,214,160,0.12)",fg:S.a},idle:{bg:"rgba(255,255,255,0.04)",fg:"#64748b"},connecting:{bg:"rgba(245,158,11,0.12)",fg:"#f59e0b"},error:{bg:"rgba(239,68,68,0.12)",fg:"#ef4444"}}[s]||{bg:"rgba(255,255,255,0.04)",fg:"#64748b"};return<div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 12px",borderRadius:20,background:c.bg,fontSize:12,fontWeight:500,color:c.fg}}><div style={{width:6,height:6,borderRadius:"50%",background:c.fg,animation:s==="live"?"pd 2s ease infinite":"none"}}/>{label}</div>;}
 
 function Wave({analyser,on,h=140}){const ref=useRef();const af=useRef();useEffect(()=>{const c=ref.current;if(!c)return;const x=c.getContext("2d");const dp=devicePixelRatio||1;function rs(){const r=c.getBoundingClientRect();c.width=r.width*dp;c.height=r.height*dp;x.setTransform(dp,0,0,dp,0,0);}rs();addEventListener("resize",rs);function draw(){af.current=requestAnimationFrame(draw);const r=c.getBoundingClientRect(),w=r.width,ht=r.height;x.clearRect(0,0,w,ht);if(!analyser||!on){x.strokeStyle="rgba(6,214,160,0.15)";x.lineWidth=1.5;x.beginPath();const t=Date.now()/1000;for(let i=0;i<w;i++){const y=ht/2+Math.sin(i/w*6+t*2)*2;i===0?x.moveTo(i,y):x.lineTo(i,y);}x.stroke();return;}const bl=analyser.frequencyBinCount,fd=new Uint8Array(bl);analyser.getByteFrequencyData(fd);const bc=Math.min(100,Math.floor(w/6)),bw=w/bc,gp=2;for(let i=0;i<bc;i++){const idx=Math.floor(Math.pow(i/bc,1.5)*bl*0.6),v=fd[idx]/255,bh=Math.max(2,v*ht*0.9);const g=x.createLinearGradient(0,ht,0,ht-bh);g.addColorStop(0,"rgba(6,214,160,0.7)");g.addColorStop(0.4,"rgba(6,182,212,0.5)");g.addColorStop(1,"rgba(6,214,160,0.05)");x.fillStyle=g;const px=i*bw+gp/2,bd=bw-gp,rr=Math.min(2,bd/2);x.beginPath();x.moveTo(px+rr,ht-bh);x.lineTo(px+bd-rr,ht-bh);x.quadraticCurveTo(px+bd,ht-bh,px+bd,ht-bh+rr);x.lineTo(px+bd,ht);x.lineTo(px,ht);x.lineTo(px,ht-bh+rr);x.quadraticCurveTo(px,ht-bh,px+rr,ht-bh);x.fill();}const td=new Uint8Array(bl);analyser.getByteTimeDomainData(td);x.strokeStyle="rgba(6,214,160,0.3)";x.lineWidth=1.5;x.beginPath();for(let i=0;i<bl;i++){const px=(i/bl)*w,py=(td[i]/255)*ht;i===0?x.moveTo(px,py):x.lineTo(px,py);}x.stroke();}draw();return()=>{cancelAnimationFrame(af.current);removeEventListener("resize",rs);};},[analyser,on]);return<canvas ref={ref} style={{width:"100%",height:h,borderRadius:10,background:"rgba(0,0,0,0.3)",display:"block"}}/>;}
-function VU({analyser,on}){const[lv,set]=useState(0);const rf=useRef();useEffect(()=>{if(!analyser||!on){set(0);return;}const d=new Uint8Array(analyser.frequencyBinCount);function t(){rf.current=requestAnimationFrame(t);analyser.getByteFrequencyData(d);let s=0;for(let i=0;i<d.length;i++)s+=d[i];set(s/d.length/255);}t();return()=>cancelAnimationFrame(rf.current);},[analyser,on]);const db=lv>0?Math.max(-60,20*Math.log10(lv)):-60,p=Math.max(0,(db+60)/60*100);return(<div style={{display:"flex",alignItems:"center",gap:10,fontSize:12}}><span style={{color:"#64748b",fontFamily:S.m,minWidth:50,fontSize:11}}>{lv>0.001?`${db.toFixed(0)} dB`:"— dB"}</span><div style={{flex:1,height:6,background:"rgba(255,255,255,0.05)",borderRadius:3,overflow:"hidden"}}><div style={{width:`${p}%`,height:"100%",borderRadius:3,transition:"width 0.08s linear",background:p>85?"linear-gradient(90deg,#06d6a0,#f59e0b,#ef4444)":p>50?"linear-gradient(90deg,#06d6a0,#06b6d4)":S.a}}/></div></div>);}
+function VU({analyser,on}){const[lv,set]=useState(0);const rf=useRef();useEffect(()=>{if(!analyser||!on){set(0);return;}const d=new Uint8Array(analyser.frequencyBinCount);function t(){rf.current=requestAnimationFrame(t);analyser.getByteFrequencyData(d);let s=0;for(let i=0;i<d.length;i++)s+=d[i];set(s/d.length/255);}t();return()=>cancelAnimationFrame(rf.current);},[analyser,on]);const db=lv>0?Math.max(-60,20*Math.log10(lv)):-60,p=Math.max(0,(db+60)/60*100);return<div style={{display:"flex",alignItems:"center",gap:10,fontSize:12}}><span style={{color:"#64748b",fontFamily:S.m,minWidth:50,fontSize:11}}>{lv>0.001?`${db.toFixed(0)} dB`:"— dB"}</span><div style={{flex:1,height:6,background:"rgba(255,255,255,0.05)",borderRadius:3,overflow:"hidden"}}><div style={{width:`${p}%`,height:"100%",borderRadius:3,transition:"width 0.08s linear",background:p>85?"linear-gradient(90deg,#06d6a0,#f59e0b,#ef4444)":p>50?"linear-gradient(90deg,#06d6a0,#06b6d4)":S.a}}/></div></div>;}
 
-// ══════════ CHAT COMPONENT ══════════
 function Chat({messages,onSend,myName}){
   const[text,setText]=useState("");const endRef=useRef();
   useEffect(()=>{endRef.current?.scrollIntoView({behavior:"smooth"});},[messages.length]);
   function send(){const t=text.trim();if(!t)return;onSend(t);setText("");}
-  return(<div style={{...S.g,padding:"14px",display:"flex",flexDirection:"column",height:220}}>
-    <div style={{fontSize:13,fontWeight:600,marginBottom:8,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-      <span>💬 Chat</span><span style={{fontSize:10,color:"#475569"}}>{messages.length} msgs</span>
-    </div>
+  return<div style={{...S.g,padding:"14px",display:"flex",flexDirection:"column",height:200}}>
+    <div style={{fontSize:13,fontWeight:600,marginBottom:8,display:"flex",justifyContent:"space-between"}}><span>💬 Chat</span><span style={{fontSize:10,color:"#475569"}}>{messages.length}</span></div>
     <div style={{flex:1,overflowY:"auto",marginBottom:8,fontSize:12,lineHeight:1.5}}>
-      {messages.length===0&&<p style={{color:"#475569",fontStyle:"italic",textAlign:"center",padding:"16px 0"}}>No messages yet</p>}
-      {messages.map((m,i)=>(
-        <div key={i} style={{marginBottom:4}}>
-          <span style={{color:m.from===myName?S.a:"#94a3b8",fontWeight:600,fontFamily:S.m,fontSize:10}}>{m.from}</span>
-          <span style={{color:"#334155",fontSize:9,marginLeft:6}}>{fmtT(m.t)}</span>
-          <div style={{color:"#cbd5e1"}}>{m.text}</div>
-        </div>
-      ))}
+      {messages.length===0&&<p style={{color:"#475569",fontStyle:"italic",textAlign:"center",padding:"12px 0",fontSize:11}}>No messages yet</p>}
+      {messages.map((m,i)=><div key={i} style={{marginBottom:4}}><span style={{color:m.from===myName?S.a:"#94a3b8",fontWeight:600,fontFamily:S.m,fontSize:10}}>{m.from}</span><span style={{color:"#334155",fontSize:9,marginLeft:6}}>{fmtT(m.t)}</span><div style={{color:"#cbd5e1"}}>{m.text}</div></div>)}
       <div ref={endRef}/>
     </div>
-    <div style={{display:"flex",gap:6}}>
-      <input value={text} onChange={e=>setText(e.target.value)} placeholder="Message..."
-        onKeyDown={e=>{if(e.key==="Enter")send();}}
-        style={{flex:1,padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#e0e4ec",fontSize:12,fontFamily:S.f,outline:"none"}}/>
-      <Btn onClick={send} style={{padding:"8px 14px",fontSize:11}}>Send</Btn>
-    </div>
-  </div>);
+    <div style={{display:"flex",gap:6}}><input value={text} onChange={e=>setText(e.target.value)} placeholder="Message..." onKeyDown={e=>{if(e.key==="Enter")send();}} style={{flex:1,padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#e0e4ec",fontSize:12,fontFamily:S.f,outline:"none"}}/><Btn onClick={send} style={{padding:"8px 14px",fontSize:11}}>Send</Btn></div>
+  </div>;
 }
 
-// ══════════ LANDING ══════════
-function Landing({onHost,onJoin}){const[code,setCode]=useState("");const[name]=useState(gn);return(
-  <div style={{fontFamily:S.f,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:20,position:"relative",overflow:"hidden"}}><BG/><div style={{position:"relative",zIndex:1,textAlign:"center",maxWidth:440,width:"100%"}}>
-    <div className="fi" style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(6,214,160,0.08)",border:"1px solid rgba(6,214,160,0.15)",borderRadius:20,padding:"6px 16px",fontSize:12,color:S.a,marginBottom:28,fontWeight:500}}>● Synchronized Multi-Device Audio</div>
-    <div className="fi fd1"><Logo big/></div>
-    <p className="fi fd1" style={{color:"#64748b",fontSize:14,lineHeight:1.6,marginTop:12,marginBottom:36}}>Turn every device into a synchronized speaker.<br/>Live audio, perfectly in sync on every phone.</p>
-    <div className="fi fd1" style={{...S.g,padding:"28px 24px",marginBottom:16,textAlign:"left"}}><h3 style={{fontSize:15,fontWeight:600,marginBottom:4}}>🎧 Host</h3><p style={{fontSize:12,color:"#64748b",marginBottom:18,lineHeight:1.5}}>Capture from your mixer. All phones play in perfect sync.</p><Btn onClick={()=>onHost(name)} style={{width:"100%",justifyContent:"center"}}>Create Room</Btn></div>
-    <div className="fi fd2" style={{...S.g,padding:"28px 24px",textAlign:"left"}}><h3 style={{fontSize:15,fontWeight:600,marginBottom:4}}>📱 Join</h3><p style={{fontSize:12,color:"#64748b",marginBottom:14}}>Enter a room code to listen.</p>
-      <div style={{display:"flex",gap:10}}><input value={code} onChange={e=>setCode(e.target.value.toUpperCase())} placeholder="Room code..." maxLength={5} style={{flex:1,padding:"10px 14px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#e0e4ec",fontSize:15,fontFamily:S.m,fontWeight:600,letterSpacing:"0.2em",outline:"none",textAlign:"center"}} onKeyDown={e=>{if(e.key==="Enter"&&code.length>=3)onJoin(code,name);}}/><Btn onClick={()=>code.length>=3&&onJoin(code,name)} disabled={code.length<3}>Join</Btn></div>
-      <div style={{marginTop:12,fontSize:12,color:"#475569",display:"flex",alignItems:"center",gap:6}}>As <span style={{fontFamily:S.m,fontSize:11,fontWeight:500,background:S.d,color:S.a,padding:"2px 8px",borderRadius:4}}>{name}</span></div>
-    </div><p style={{marginTop:24,fontSize:11,color:"#334155"}}>Built for The DJ Lab · thedjlab.ca <VerBadge/></p>
-  </div></div>);}
 
-// ══════════ HOST ══════════
-function Host({userName,onLeave}){
-  const[devs,setDevs]=useState([]);const[sel,setSel]=useState("");const[mode,setMode]=useState("device");
-  const[cap,setCap]=useState(false);const[mon,setMon]=useState(false);const[err,setErr]=useState(null);
-  const[elapsed,setElapsed]=useState(0);const[wsOk,setWsOk]=useState(false);const[room,setRoom]=useState("...");
-  const[ls,setLs]=useState([]);const[chat,setChat]=useState([]);const[sVer,setSVer]=useState("");const[,fup]=useState(0);
-  const ws=useRef();const ctx=useRef();const an=useRef();const stream=useRef();const wk=useRef();const mg=useRef();const ck=useRef();const si=useRef();const t0=useRef();const tmr=useRef();
+// ══════════════════════════════════════════════
+//  MAIN APP — One page, host or listen
+// ══════════════════════════════════════════════
+function App(){
+  const[name]=useState(gn);
+  const[mode,setMode]=useState("listen");  // "listen" or "host"
+  const[wsOk,setWsOk]=useState(false);
+  const[sVer,setSVer]=useState("");
+  const[hostN,setHostN]=useState("");
+  const[live,setLive]=useState(false);
+  const[streamSt,setStreamSt]=useState(null);
+  const[listeners,setListeners]=useState(0);
+  const[chat,setChat]=useState([]);
+  const[err,setErr]=useState(null);
 
-  useEffect(()=>{const w=new WebSocket(WS);ws.current=w;w.onopen=()=>setWsOk(true);w.onerror=()=>setWsOk(false);w.onclose=()=>setWsOk(false);
-    w.onmessage=e=>{if(typeof e.data!=="string")return;const m=JSON.parse(e.data);
-      if(m.type==="welcome"){setSVer(m.version||"");ck.current=new Clock(o=>w.readyState===1&&w.send(JSON.stringify(o)));w.send(JSON.stringify({type:"create-room",name:userName,sr:SR}));}
-      if(m.type==="room-created"){setRoom(m.room);ck.current?.ping();si.current=setInterval(()=>ck.current?.ping(),2000);}
-      if(m.type==="sync-pong")ck.current?.pong(m);
-      if(m.type==="l+")setLs(p=>[...p,{id:m.id,name:m.name}]);
-      if(m.type==="l-")setLs(p=>p.filter(l=>l.id!==m.id));
-      if(m.type==="chat")setChat(p=>[...p,{from:m.from,text:m.text,t:m.t}]);};
-    return()=>{w.close();clearInterval(si.current);};},[]);
-  useEffect(()=>{(async()=>{try{const t=await navigator.mediaDevices.getUserMedia({audio:true});t.getTracks().forEach(t=>t.stop());setDevs((await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="audioinput"));}catch(e){}})();return()=>stopCap();},[]);
-  useEffect(()=>{if(cap){t0.current=Date.now();tmr.current=setInterval(()=>setElapsed(Math.floor((Date.now()-t0.current)/1000)),1000);}else{clearInterval(tmr.current);setElapsed(0);}return()=>clearInterval(tmr.current);},[cap]);
-  useEffect(()=>{if(mg.current)mg.current.gain.value=mon?1:0;},[mon]);
+  // Host state
+  const[devs,setDevs]=useState([]);const[sel,setSel]=useState("");const[srcMode,setSrcMode]=useState("device");
+  const[cap,setCap]=useState(false);const[mon,setMon]=useState(false);const[capErr,setCapErr]=useState(null);
+  const[elapsed,setElapsed]=useState(0);
 
-  function sendChat(text){ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"chat",text}));}
+  // Listener state
+  const[playing,setPlaying]=useState(false);const[vol,setVol]=useState(85);
+  const[rtt,setRtt]=useState(null);const[syncOff,setSyncOff]=useState(null);
+  const[unlocked,setUnlocked]=useState(false);
 
-  async function startCap(){setErr(null);try{let s;
-    if(mode==="system"){s=await navigator.mediaDevices.getDisplayMedia({video:{width:1,height:1},audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:SR}});if(!s.getAudioTracks().length){s.getTracks().forEach(t=>t.stop());setErr("No audio. Share a Chrome Tab, check 'Also share tab audio'.");return;}s.getVideoTracks().forEach(t=>t.stop());}
-    else{s=await navigator.mediaDevices.getUserMedia({audio:{deviceId:sel?{exact:sel}:undefined,echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:SR,channelCount:2}});}
-    stream.current=s;const c=new(AudioContext||webkitAudioContext)({sampleRate:SR});ctx.current=c;
-    const src=c.createMediaStreamSource(s);const a=c.createAnalyser();a.fftSize=2048;a.smoothingTimeConstant=0.8;src.connect(a);an.current=a;
-    const g=c.createGain();g.gain.value=0;src.connect(g);g.connect(c.destination);mg.current=g;
-    let ok=false;try{const u=mkURL(CAP_CODE);await c.audioWorklet.addModule(u);URL.revokeObjectURL(u);
-      const n=new AudioWorkletNode(c,'cap',{processorOptions:{sz:CHUNK},numberOfInputs:1,numberOfOutputs:1,channelCount:2});
-      n.port.onmessage=ev=>{const w=ws.current;if(w&&w.readyState===1)w.send(ev.data);};
-      src.connect(n);n.connect(c.destination);wk.current=n;ok=true;}catch(e){console.warn("Worklet fallback",e);}
-    if(!ok){const p=c.createScriptProcessor(CHUNK,2,1);p.onaudioprocess=ev=>{const w=ws.current;if(!w||w.readyState!==1)return;const L=ev.inputBuffer.getChannelData(0),R=ev.inputBuffer.numberOfChannels>1?ev.inputBuffer.getChannelData(1):L;const o=new Int16Array(L.length);for(let i=0;i<L.length;i++)o[i]=Math.max(-32768,Math.min(32767,Math.round(((L[i]+R[i])*.5)*32767)));w.send(o.buffer);};src.connect(p);p.connect(c.destination);wk.current=p;}
-    ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"host-live",live:true}));
-    setCap(true);fup(n=>n+1);s.getTracks().forEach(t=>{t.onended=()=>stopCap();});
-  }catch(e){if(e.name==="NotAllowedError")setErr("Permission denied.");else setErr("Error: "+e.message);}}
-
-  function stopCap(){ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"host-live",live:false}));
-    try{wk.current?.disconnect();}catch(e){}wk.current=null;if(stream.current){stream.current.getTracks().forEach(t=>t.stop());stream.current=null;}
-    if(ctx.current){ctx.current.close().catch(()=>{});ctx.current=null;}an.current=null;mg.current=null;setCap(false);setMon(false);fup(n=>n+1);}
-
-  const qr=room!=="..."?`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(location.origin+location.pathname+"?room="+room)}&bgcolor=08090d&color=06d6a0&format=svg`:"";
-  return(<div style={{fontFamily:S.f,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",position:"relative",overflow:"hidden"}}><BG/><div style={{position:"relative",zIndex:1,maxWidth:960,margin:"0 auto",padding:"20px 20px 40px"}}>
-    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24,flexWrap:"wrap",gap:12}}><div style={{display:"flex",alignItems:"center",gap:10}}><Logo/><VerBadge v={sVer}/></div><div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}><Pill s={!wsOk?"error":cap?"live":"idle"} label={!wsOk?"Server Error":cap?`LIVE · ${ft(elapsed)}`:"Ready"}/><Btn v="danger" onClick={()=>{stopCap();ws.current?.send(JSON.stringify({type:"leave"}));onLeave();}} style={{padding:"8px 14px",fontSize:12}}>Leave</Btn></div></div>
-    <div className="hg" style={{display:"grid",gridTemplateColumns:"1fr 300px",gap:20,alignItems:"start"}}>
-      <div style={{display:"flex",flexDirection:"column",gap:16}}>
-        <div className="fi" style={{...S.g,padding:"22px 20px"}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:8}}><h3 style={{fontSize:14,fontWeight:600,margin:0}}>Audio Source</h3>
-            <div style={{display:"flex",background:"rgba(255,255,255,0.04)",borderRadius:8,overflow:"hidden",border:"1px solid rgba(255,255,255,0.06)"}}>{[{k:"device",l:"🎛 Device"},{k:"system",l:"🖥 System"}].map(m=><button key={m.k} onClick={()=>!cap&&setMode(m.k)} style={{padding:"6px 14px",border:"none",fontSize:12,fontWeight:500,fontFamily:S.f,cursor:cap?"not-allowed":"pointer",background:mode===m.k?S.d:"transparent",color:mode===m.k?S.a:"#64748b",transition:"all 0.2s"}}>{m.l}</button>)}</div></div>
-          {mode==="device"?<div style={{marginBottom:14}}><select value={sel} onChange={e=>setSel(e.target.value)} style={{width:"100%",padding:"10px 14px",borderRadius:8,background:"rgba(255,255,255,0.04)",color:"#e0e4ec",border:"1px solid rgba(255,255,255,0.08)",fontSize:13,fontFamily:S.f,outline:"none",cursor:"pointer",appearance:"none"}}><option value="">Select audio source...</option>{devs.map(d=><option key={d.deviceId} value={d.deviceId}>{d.label||`Device ${d.deviceId.slice(0,8)}`}</option>)}</select></div>
-          :<div style={{padding:"14px 16px",borderRadius:8,background:"rgba(6,214,160,0.05)",border:"1px solid rgba(6,214,160,0.1)",marginBottom:14}}><p style={{fontSize:12,color:"#94a3b8",lineHeight:1.6,margin:0}}><strong style={{color:S.a}}>System Audio</strong> — Share a Chrome Tab, check "Also share tab audio".</p></div>}
-          <div style={{display:"flex",gap:10}}>{!cap?<Btn onClick={startCap} disabled={!wsOk} style={{flex:1,justifyContent:"center"}}>▶ Start Broadcasting</Btn>:<Btn v="danger" onClick={stopCap} style={{flex:1,justifyContent:"center"}}>⏹ Stop</Btn>}</div>
-          {err&&<div style={{marginTop:12,padding:"10px 14px",borderRadius:8,background:"rgba(239,68,68,0.08)",fontSize:12,color:"#fca5a5"}}>{err}</div>}
-        </div>
-        <div className="fi fd1" style={{...S.g,padding:"18px"}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}><h3 style={{fontSize:14,fontWeight:600,margin:0}}>{cap?"Live":"Preview"}</h3>{cap&&<div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:S.a,fontFamily:S.m}}><div style={{width:5,height:5,borderRadius:"50%",background:S.a,animation:"pd 1.5s ease infinite"}}/>48kHz</div>}</div><Wave analyser={an.current} on={cap} h={140}/><div style={{marginTop:10}}><VU analyser={an.current} on={cap}/></div></div>
-        <Chat messages={chat} onSend={sendChat} myName={userName}/>
-      </div>
-      <div className="rs" style={{display:"flex",flexDirection:"column",gap:16}}>
-        <div className="fi" style={{...S.g,padding:"22px 20px",textAlign:"center"}}><p style={{fontSize:11,color:"#64748b",marginBottom:6,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:600}}>Room</p><div style={{fontSize:36,fontWeight:800,letterSpacing:"0.15em",fontFamily:S.m,color:S.a,textShadow:"0 0 30px rgba(6,214,160,0.3)",marginBottom:16}}>{room}</div><div style={{width:160,height:160,margin:"0 auto 12px",background:"#0d1117",borderRadius:12,padding:10,border:"1px solid rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center"}}>{qr&&<img src={qr} alt="QR" style={{width:140,height:140,borderRadius:6}}/>}</div><p style={{fontSize:11,color:"#475569"}}>Scan to join · {BUF_SEC}s sync buffer</p></div>
-        <div className="fi fd1" style={{...S.g,padding:"18px 16px"}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}><h3 style={{fontSize:14,fontWeight:600,margin:0}}>Listeners</h3><span style={{fontSize:11,fontFamily:S.m,color:S.a,background:S.d,padding:"2px 8px",borderRadius:4}}>{ls.length}</span></div>{ls.length===0?<p style={{fontSize:12,color:"#475569",textAlign:"center",padding:"16px 0",fontStyle:"italic"}}>Waiting...</p>:<div style={{display:"flex",flexDirection:"column",gap:8}}>{ls.map(l=><div key={l.id} style={{...S.g,padding:"10px 14px",display:"flex",alignItems:"center",gap:10}}><span>📱</span><div style={{flex:1}}><div style={{fontSize:13,fontWeight:500}}>{l.name}</div><div style={{fontSize:10,color:S.a,fontFamily:S.m}}>● synced</div></div></div>)}</div>}</div>
-        <div className="fi fd2" style={{...S.g,padding:"14px 16px",cursor:cap?"pointer":"default"}} onClick={()=>cap&&setMon(!mon)}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}><div><div style={{fontSize:13,fontWeight:500}}>Monitor</div><div style={{fontSize:11,color:"#64748b"}}>Hear locally</div></div><div style={{width:40,height:22,borderRadius:11,background:mon?"rgba(6,214,160,0.3)":"rgba(255,255,255,0.08)",position:"relative",transition:"background 0.2s"}}><div style={{width:16,height:16,borderRadius:"50%",position:"absolute",top:3,left:mon?21:3,transition:"all 0.2s",background:mon?S.a:"#475569"}}/></div></div></div>
-      </div>
-    </div></div></div>);}
-
-
-// ══════════════════════════════════════════════════════════════
-//  LISTENER — THE SYNC ENGINE
-//  
-//  How it works:
-//  1. Chunks arrive via WebSocket, get written into a JS-side Float32 ring buffer
-//     at positions calculated from (serverTime - streamStart)
-//  2. A scheduler runs every 400ms. It reads ~1.5s blocks from the ring buffer.
-//  3. Each block becomes an AudioBuffer played via AudioBufferSourceNode.start(exactCtxTime)
-//     → This is HARDWARE-SCHEDULED by the audio driver, not JavaScript. Sub-ms precision.
-//  4. exactCtxTime is computed from the NTP-synced server clock + shared streamStart.
-//     Since all devices share streamStart and agree on server time, they all compute
-//     the same exactCtxTime → they all play the same sample at the same moment.
-//  5. Tiny 64-sample crossfade at block edges prevents clicks.
-//     With 1.5s blocks, that's only ~0.7 boundaries per second (vs 6/sec in v2).
-// ══════════════════════════════════════════════════════════════
-function Listener({roomCode,userName,onLeave}){
-  const[wsOk,setWsOk]=useState(false);const[joined,setJoined]=useState(false);const[host,setHost]=useState("Host");
-  const[live,setLive]=useState(false);const[playing,setPlaying]=useState(false);const[vol,setVol]=useState(85);
-  const[rtt,setRtt]=useState(null);const[off,setOff]=useState(null);const[err,setErr]=useState(null);
-  const[chat,setChat]=useState([]);const[sVer,setSVer]=useState("");const[,fup]=useState(0);
-
-  const ws=useRef();const ctx=useRef();const gainNode=useRef();const anNode=useRef();
-  const ck=useRef();const si=useRef();const schedRef=useRef();
-
-  // Ring buffer (JS-side, absorbs network jitter)
+  // Refs
+  const ws=useRef();const ck=useRef();const si=useRef();
+  // Host refs
+  const hCtx=useRef();const hAn=useRef();const hStream=useRef();const hWk=useRef();const hMg=useRef();const hT0=useRef();const hTmr=useRef();
+  // Listener refs
+  const lCtx=useRef();const lGain=useRef();const lAn=useRef();const schedRef=useRef();
   const ring=useRef(new Float32Array(RING_LEN));
   const streamStartRef=useRef(null);
+  const schedPos=useRef(0);const writePos=useRef(0);const started=useRef(false);
+  const[,fup]=useState(0);
 
-  // Scheduler state
-  const schedulePos=useRef(0);   // how far we've scheduled (in samples from stream start)
-  const writePos=useRef(0);      // how far we've written
-  const ctxT0=useRef(0);         // Date.now() when AudioContext was created
-  const started=useRef(false);
+  // ─── Listener: write chunk into ring buffer ───
+  function writeChunk(serverTime,pcmI16){
+    const ss=streamStartRef.current;if(ss===null)return;
+    const f32=i2f(pcmI16);
+    const pos=Math.round(((serverTime-ss)/1000)*SR);
+    for(let i=0;i<f32.length;i++)ring.current[(pos+i)%RING_LEN]=f32[i];
+    const end=pos+f32.length;
+    if(end>writePos.current)writePos.current=end;
+  }
 
-  function initAudio(){
-    if(ctx.current)return;
-    const c=new(AudioContext||webkitAudioContext)({sampleRate:SR});
-    ctx.current=c;
-    ctxT0.current=Date.now();
-    const g=c.createGain();g.gain.value=vol/100;gainNode.current=g;
-    const a=c.createAnalyser();a.fftSize=2048;a.smoothingTimeConstant=0.8;anNode.current=a;
+  // ─── Listener: THE SCHEDULER ───
+  // Reads from ring buffer, schedules AudioBufferSourceNode.start(exactTime)
+  // Sync formula: NO Date.now() in scheduling path.
+  //   waitMs = desiredServerPlayTime - clock.now()
+  //   ctxPlayTime = audioCtx.currentTime + waitMs / 1000
+  // Every device computes same waitMs (shared server clock via NTP)
+  // → same offset from their own hardware audio clock → plays at same moment
+  function runScheduler(){
+    const c=lCtx.current;
+    const clock=ck.current;
+    const ss=streamStartRef.current;
+    if(!c||!clock||!clock.ready||ss===null||c.state==="closed")return;
+
+    const avail=writePos.current-schedPos.current;
+
+    if(!started.current){
+      if(avail<SR*BUF_SEC)return;
+      const serverNow=clock.now();
+      const streamPos=Math.round(((serverNow-ss)/1000)*SR);
+      schedPos.current=Math.max(0,streamPos-Math.round(BUF_SEC*SR));
+      started.current=true;
+    }
+
+    while(schedPos.current+BLOCK_N<=writePos.current){
+      const bStart=schedPos.current;
+      const bLen=Math.min(BLOCK_N,writePos.current-bStart);
+      if(bLen<SR*0.1)break;
+
+      const samples=new Float32Array(bLen);
+      for(let i=0;i<bLen;i++)samples[i]=ring.current[(bStart+i)%RING_LEN];
+
+      // Crossfade edges
+      for(let i=0;i<FADE&&i<bLen;i++){const g=i/FADE;samples[i]*=g;samples[bLen-1-i]*=g;}
+
+      const buf=c.createBuffer(1,bLen,SR);
+      buf.getChannelData(0).set(samples);
+
+      // *** THE SYNC FORMULA ***
+      // When should this block play in server time?
+      const blockServerTime=ss+(bStart/SR)*1000;
+      const desiredPlayServer=blockServerTime+BUF_SEC*1000;
+      // How many ms from RIGHT NOW (in server time) until play?
+      const waitMs=desiredPlayServer-clock.now();
+      // Convert to AudioContext time (hardware clock, NOT Date.now())
+      const ctxPlayTime=c.currentTime+waitMs/1000;
+
+      if(ctxPlayTime<c.currentTime-0.1){schedPos.current+=bLen;continue;}
+
+      const src=c.createBufferSource();
+      src.buffer=buf;
+      src.connect(lGain.current);
+      src.start(Math.max(ctxPlayTime,c.currentTime+0.005));
+
+      schedPos.current+=bLen;
+      if(!playing)setPlaying(true);
+    }
+  }
+
+  // ─── Init listener audio context ───
+  function initListenerAudio(){
+    if(lCtx.current)return;
+    const c=new(AudioContext||webkitAudioContext)({sampleRate:SR});lCtx.current=c;
+    const g=c.createGain();g.gain.value=vol/100;lGain.current=g;
+    const a=c.createAnalyser();a.fftSize=2048;a.smoothingTimeConstant=0.8;lAn.current=a;
     g.connect(a);a.connect(c.destination);
     if(c.state==="suspended")c.resume();
     fup(n=>n+1);
   }
 
-  // Write a chunk into the ring buffer at the correct position
-  function writeChunk(serverTime, pcmInt16){
-    const ss=streamStartRef.current;
-    if(ss===null)return;
-    const f32=i16f32(pcmInt16);
-    // Position in stream based on server timestamp
-    const elapsedMs=serverTime-ss;
-    const pos=Math.round((elapsedMs/1000)*SR);
-    // Write into ring buffer (wrapping)
-    for(let i=0;i<f32.length;i++){
-      ring.current[(pos+i)%RING_LEN]=f32[i];
-    }
-    // Track furthest written position
-    const endPos=pos+f32.length;
-    if(endPos>writePos.current)writePos.current=endPos;
-  }
-
-  // THE SCHEDULER — runs every SCHED_INTERVAL ms
-  // Reads from ring buffer, creates AudioBufferSourceNodes, schedules with hardware precision
-  function runScheduler(){
-    const c=ctx.current;
-    const clock=ck.current;
-    const ss=streamStartRef.current;
-    if(!c||!clock||!clock.ready||ss===null||c.state==="closed")return;
-
-    // How much audio is available but not yet scheduled?
-    const available=writePos.current-schedulePos.current;
-
-    // Need at least 1 second of audio to schedule, and BUF_SEC of buffer before first play
-    if(!started.current){
-      if(available<SR*BUF_SEC)return; // wait until buffer is full
-      // First play: snap schedulePos to a clean position
-      // We want to start playing audio from BUF_SEC ago (in stream time)
-      const serverNow=clock.now();
-      const streamElapsedMs=serverNow-ss;
-      const streamPosSamples=Math.round((streamElapsedMs/1000)*SR);
-      schedulePos.current=Math.max(0,streamPosSamples-Math.round(BUF_SEC*SR));
-      started.current=true;
-    }
-
-    // Schedule blocks until we're caught up
-    while(schedulePos.current+BLOCK_SAMPLES<=writePos.current){
-      const blockStart=schedulePos.current;
-      const blockSamples=Math.min(BLOCK_SAMPLES,writePos.current-blockStart);
-      if(blockSamples<SR*0.1)break; // too small
-
-      // Read from ring buffer
-      const samples=new Float32Array(blockSamples);
-      for(let i=0;i<blockSamples;i++){
-        samples[i]=ring.current[(blockStart+i)%RING_LEN];
-      }
-
-      // Apply fade envelope at edges to prevent clicks
-      for(let i=0;i<FADE&&i<blockSamples;i++){
-        const g=i/FADE;
-        samples[i]*=g;
-        samples[blockSamples-1-i]*=g;
-      }
-
-      // Create AudioBuffer
-      const buf=c.createBuffer(1,blockSamples,SR);
-      buf.getChannelData(0).set(samples);
-
-      // Calculate exact play time
-      // serverTime of this block's start = streamStart + (blockStart / SR) * 1000
-      // desired play (server time) = that + BUF_SEC * 1000
-      // convert to local time = desired - clock.offset
-      // convert to ctx time = (localTime - ctxT0) / 1000
-      const serverTimeOfBlock=ss+(blockStart/SR)*1000;
-      const desiredServerPlay=serverTimeOfBlock+BUF_SEC*1000;
-      const desiredLocalPlay=desiredServerPlay-clock.offset;
-      const ctxPlayTime=(desiredLocalPlay-ctxT0.current)/1000;
-
-      // If this would be in the past, skip
-      if(ctxPlayTime<c.currentTime-0.1){
-        schedulePos.current+=blockSamples;
-        continue;
-      }
-
-      // Schedule with hardware precision
-      const src=c.createBufferSource();
-      src.buffer=buf;
-      src.connect(gainNode.current);
-      const startAt=Math.max(ctxPlayTime,c.currentTime+0.01);
-      src.start(startAt);
-
-      schedulePos.current+=blockSamples;
-
-      if(!playing){setPlaying(true);}
-    }
-  }
-
-  function sendChat(text){ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"chat",text}));}
-
+  // ─── WebSocket ───
   useEffect(()=>{
-    initAudio();
     const w=new WebSocket(WS);ws.current=w;w.binaryType="arraybuffer";
-    w.onopen=()=>setWsOk(true);w.onerror=()=>{setWsOk(false);setErr("Cannot connect to server.");};w.onclose=()=>setWsOk(false);
+    w.onopen=()=>{setWsOk(true);w.send(JSON.stringify({type:"listen",name}));};
+    w.onerror=()=>setWsOk(false);w.onclose=()=>setWsOk(false);
     w.onmessage=(e)=>{
       if(e.data instanceof ArrayBuffer){const{seq,t,pcm}=unpack(e.data);writeChunk(t,pcm);return;}
       const m=JSON.parse(e.data);
-      if(m.type==="welcome"){setSVer(m.version||"");ck.current=new Clock(o=>w.readyState===1&&w.send(JSON.stringify(o)));w.send(JSON.stringify({type:"join",room:roomCode,name:userName}));}
-      if(m.type==="joined"){setJoined(true);setHost(m.host);setLive(m.live);if(m.streamStart)streamStartRef.current=m.streamStart;if(m.chatHistory)setChat(m.chatHistory);ck.current?.ping();si.current=setInterval(()=>{ck.current?.ping();setRtt(ck.current?.rtt||null);setOff(ck.current?.offset||null);},2000);}
-      if(m.type==="sync-pong"){ck.current?.pong(m);setRtt(ck.current?.rtt||null);setOff(ck.current?.offset||null);}
-      if(m.type==="host-live"){setLive(m.live);if(m.live&&m.streamStart){streamStartRef.current=m.streamStart;ring.current=new Float32Array(RING_LEN);writePos.current=0;schedulePos.current=0;started.current=false;setPlaying(false);}if(!m.live){setPlaying(false);started.current=false;streamStartRef.current=null;}}
-      if(m.type==="chat")setChat(p=>[...p,{from:m.from,text:m.text,t:m.t}]);
-      if(m.type==="closed"){setErr("Room closed.");setPlaying(false);}
-      if(m.type==="error")setErr(m.msg);
+      switch(m.type){
+        case"welcome":setSVer(m.version);setHostN(m.host||"");setLive(m.live);
+          if(m.streamStart){streamStartRef.current=m.streamStart;setStreamSt(m.streamStart);}
+          if(m.chatHistory)setChat(m.chatHistory);
+          ck.current=new Clock(o=>w.readyState===1&&w.send(JSON.stringify(o)));
+          ck.current.ping();si.current=setInterval(()=>{ck.current?.ping();setRtt(ck.current?.rtt||null);setSyncOff(ck.current?.offset||null);},2000);
+          break;
+        case"listen-ok":setSVer(m.version);setHostN(m.host||"");setLive(m.live);setListeners(m.n);
+          if(m.streamStart){streamStartRef.current=m.streamStart;setStreamSt(m.streamStart);}
+          if(m.chatHistory)setChat(m.chatHistory);break;
+        case"host-ok":setSVer(m.version);break;
+        case"sync-pong":ck.current?.pong(m);setRtt(ck.current?.rtt||null);setSyncOff(ck.current?.offset||null);break;
+        case"live":setLive(m.live);
+          if(m.live&&m.streamStart){streamStartRef.current=m.streamStart;setStreamSt(m.streamStart);ring.current=new Float32Array(RING_LEN);writePos.current=0;schedPos.current=0;started.current=false;setPlaying(false);}
+          if(!m.live){setPlaying(false);started.current=false;streamStartRef.current=null;setStreamSt(null);}break;
+        case"host-changed":setHostN(m.host);break;
+        case"host-gone":setHostN("");setLive(false);setPlaying(false);started.current=false;streamStartRef.current=null;break;
+        case"l+":setListeners(m.n);break;
+        case"l-":setListeners(m.n);break;
+        case"chat":setChat(p=>[...p,{from:m.from,text:m.text,t:m.t}]);break;
+        case"error":setErr(m.msg);break;
+      }
     };
+    // Listener audio - only init after user gesture (mobile requirement)
+    // initListenerAudio() called by unlockAudio()
+    schedRef.current=setInterval(runScheduler,SCHED_MS);
 
-    // Start the scheduler
-    schedRef.current=setInterval(runScheduler,SCHED_INTERVAL);
+    // Enumerate audio devices
+    (async()=>{try{const t=await navigator.mediaDevices.getUserMedia({audio:true});t.getTracks().forEach(t=>t.stop());setDevs((await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="audioinput"));}catch(e){}})();
 
-    return()=>{w.close();clearInterval(si.current);clearInterval(schedRef.current);if(ctx.current)ctx.current.close().catch(()=>{});};
+    return()=>{w.close();clearInterval(si.current);clearInterval(schedRef.current);clearInterval(hTmr.current);
+      if(lCtx.current)lCtx.current.close().catch(()=>{});if(hCtx.current)hCtx.current.close().catch(()=>{});};
   },[]);
 
-  useEffect(()=>{if(gainNode.current)gainNode.current.gain.value=vol/100;},[vol]);
+  // Volume
+  useEffect(()=>{if(lGain.current)lGain.current.gain.value=vol/100;},[vol]);
+  // Monitor
+  useEffect(()=>{if(hMg.current)hMg.current.gain.value=mon?1:0;},[mon]);
+  // Timer
+  useEffect(()=>{if(cap){hT0.current=Date.now();hTmr.current=setInterval(()=>setElapsed(Math.floor((Date.now()-hT0.current)/1000)),1000);}else{clearInterval(hTmr.current);setElapsed(0);}return()=>clearInterval(hTmr.current);},[cap]);
 
-  return(<div style={{fontFamily:S.f,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,position:"relative",overflow:"hidden"}}><BG/><div style={{position:"relative",zIndex:1,maxWidth:420,width:"100%",textAlign:"center"}}><div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8}}><Logo/><VerBadge v={sVer}/></div>
-    <div className="fi" style={{...S.g,padding:"24px 20px",marginTop:20,textAlign:"left"}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
-        <Pill s={playing?"live":err?"error":!wsOk?"error":!joined?"connecting":"idle"} label={playing?"♫ Synced Playback":err?"Error":!wsOk?"Connecting...":!joined?"Joining...":live?"Buffering...":"Waiting for host"}/>
-        <span style={{fontFamily:S.m,fontSize:14,fontWeight:600,color:S.a,letterSpacing:"0.1em"}}>{roomCode}</span>
+  function sendChat(text){ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"chat",text}));}
+
+  function unlockAudio(){initListenerAudio();setUnlocked(true);}
+  // ─── Become host ───
+  function becomeHost(){
+    if(!unlocked)unlockAudio();
+    ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"host",name}));
+    setMode("host");
+  }
+
+  // ─── Start capture ───
+  async function startCap(){setCapErr(null);try{let s;
+    if(srcMode==="system"){s=await navigator.mediaDevices.getDisplayMedia({video:{width:1,height:1},audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:SR}});if(!s.getAudioTracks().length){s.getTracks().forEach(t=>t.stop());setCapErr("No audio. Share Chrome Tab + check 'Also share tab audio'.");return;}s.getVideoTracks().forEach(t=>t.stop());}
+    else{s=await navigator.mediaDevices.getUserMedia({audio:{deviceId:sel?{exact:sel}:undefined,echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:SR,channelCount:2}});}
+    hStream.current=s;const c=new(AudioContext||webkitAudioContext)({sampleRate:SR});hCtx.current=c;
+    const src=c.createMediaStreamSource(s);const a=c.createAnalyser();a.fftSize=2048;a.smoothingTimeConstant=0.8;src.connect(a);hAn.current=a;
+    const g=c.createGain();g.gain.value=0;src.connect(g);g.connect(c.destination);hMg.current=g;
+    let ok=false;try{const u=mkURL(CAP_CODE);await c.audioWorklet.addModule(u);URL.revokeObjectURL(u);
+      const n=new AudioWorkletNode(c,'cap',{processorOptions:{sz:CHUNK},numberOfInputs:1,numberOfOutputs:1,channelCount:2});
+      n.port.onmessage=ev=>{const w=ws.current;if(w&&w.readyState===1)w.send(ev.data);};
+      src.connect(n);n.connect(c.destination);hWk.current=n;ok=true;}catch(e){}
+    if(!ok){const p=c.createScriptProcessor(CHUNK,2,1);p.onaudioprocess=ev=>{const w=ws.current;if(!w||w.readyState!==1)return;const L=ev.inputBuffer.getChannelData(0),R=ev.inputBuffer.numberOfChannels>1?ev.inputBuffer.getChannelData(1):L;const o=new Int16Array(L.length);for(let i=0;i<L.length;i++)o[i]=Math.max(-32768,Math.min(32767,Math.round(((L[i]+R[i])*.5)*32767)));w.send(o.buffer);};src.connect(p);p.connect(c.destination);hWk.current=p;}
+    ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"live",live:true,sr:SR}));
+    setCap(true);fup(n=>n+1);s.getTracks().forEach(t=>{t.onended=()=>stopCap();});
+  }catch(e){if(e.name==="NotAllowedError")setCapErr("Permission denied.");else setCapErr("Error: "+e.message);}}
+
+  function stopCap(){
+    ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"live",live:false}));
+    try{hWk.current?.disconnect();}catch(e){}hWk.current=null;
+    if(hStream.current){hStream.current.getTracks().forEach(t=>t.stop());hStream.current=null;}
+    if(hCtx.current){hCtx.current.close().catch(()=>{});hCtx.current=null;}
+    hAn.current=null;hMg.current=null;setCap(false);setMon(false);fup(n=>n+1);
+  }
+
+  // ═══════ RENDER ═══════
+  return(
+    <div style={{fontFamily:S.f,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",position:"relative",overflow:"hidden"}}>
+      <BG/>
+      <div style={{position:"relative",zIndex:1,maxWidth:mode==="host"?960:500,margin:"0 auto",padding:"20px 20px 40px"}}>
+
+        {/* Header */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}><Logo/><span style={{fontSize:9,fontFamily:S.m,color:"#334155",background:"rgba(255,255,255,0.03)",padding:"2px 6px",borderRadius:4}}>{sVer||VER}</span></div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <Pill s={!wsOk?"error":cap?"live":playing?"live":"idle"}
+              label={!wsOk?"Offline":cap?`LIVE · ${ft(elapsed)}`:playing?"♫ Synced":live?"Buffering":"Ready"}/>
+            <span style={{fontSize:11,fontFamily:S.m,color:"#475569"}}>👥 {listeners}</span>
+          </div>
+        </div>
+
+        {mode==="host"?(
+          // ═══ HOST MODE ═══
+          <div className="hg" style={{display:"grid",gridTemplateColumns:"1fr 280px",gap:16,alignItems:"start"}}>
+            <div style={{display:"flex",flexDirection:"column",gap:14}}>
+              <div className="fi" style={{...S.g,padding:"20px"}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,flexWrap:"wrap",gap:8}}>
+                  <h3 style={{fontSize:14,fontWeight:600,margin:0}}>Audio Source</h3>
+                  <div style={{display:"flex",background:"rgba(255,255,255,0.04)",borderRadius:8,overflow:"hidden",border:"1px solid rgba(255,255,255,0.06)"}}>
+                    {[{k:"device",l:"🎛 Device"},{k:"system",l:"🖥 System"}].map(m=><button key={m.k} onClick={()=>!cap&&setSrcMode(m.k)} style={{padding:"6px 12px",border:"none",fontSize:12,fontWeight:500,fontFamily:S.f,cursor:cap?"not-allowed":"pointer",background:srcMode===m.k?S.d:"transparent",color:srcMode===m.k?S.a:"#64748b"}}>{m.l}</button>)}
+                  </div>
+                </div>
+                {srcMode==="device"?<div style={{marginBottom:12}}><select value={sel} onChange={e=>setSel(e.target.value)} style={{width:"100%",padding:"10px 14px",borderRadius:8,background:"rgba(255,255,255,0.04)",color:"#e0e4ec",border:"1px solid rgba(255,255,255,0.08)",fontSize:13,fontFamily:S.f,outline:"none",appearance:"none"}}><option value="">Select audio source...</option>{devs.map(d=><option key={d.deviceId} value={d.deviceId}>{d.label||`Device ${d.deviceId.slice(0,8)}`}</option>)}</select></div>
+                :<div style={{padding:"12px",borderRadius:8,background:"rgba(6,214,160,0.05)",border:"1px solid rgba(6,214,160,0.1)",marginBottom:12,fontSize:12,color:"#94a3b8"}}><strong style={{color:S.a}}>System Audio</strong> — Share Chrome Tab + "Also share tab audio"</div>}
+                <div style={{display:"flex",gap:10}}>{!cap?<Btn onClick={startCap} disabled={!wsOk} style={{flex:1,justifyContent:"center"}}>▶ Start Broadcasting</Btn>:<Btn v="danger" onClick={stopCap} style={{flex:1,justifyContent:"center"}}>⏹ Stop</Btn>}</div>
+                {capErr&&<div style={{marginTop:10,padding:"10px",borderRadius:8,background:"rgba(239,68,68,0.08)",fontSize:12,color:"#fca5a5"}}>{capErr}</div>}
+              </div>
+              <div className="fi fd1" style={{...S.g,padding:"16px"}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}><h3 style={{fontSize:14,fontWeight:600,margin:0}}>{cap?"Live":"Preview"}</h3>{cap&&<div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:S.a,fontFamily:S.m}}><div style={{width:5,height:5,borderRadius:"50%",background:S.a,animation:"pd 1.5s ease infinite"}}/>48kHz</div>}</div><Wave analyser={hAn.current} on={cap} h={130}/><div style={{marginTop:8}}><VU analyser={hAn.current} on={cap}/></div></div>
+              <Chat messages={chat} onSend={sendChat} myName={name}/>
+            </div>
+            <div className="rs" style={{display:"flex",flexDirection:"column",gap:14}}>
+              <div className="fi" style={{...S.g,padding:"16px",textAlign:"center"}}>
+                <p style={{fontSize:12,fontWeight:600,color:"#64748b",marginBottom:4}}>Share this URL</p>
+                <div style={{padding:"10px",borderRadius:8,background:"rgba(255,255,255,0.03)",fontSize:11,color:S.a,fontFamily:S.m,wordBreak:"break-all"}}>{location.origin}</div>
+                <p style={{fontSize:10,color:"#475569",marginTop:8}}>Phones go here · {BUF_SEC}s sync buffer</p>
+              </div>
+              <div className="fi fd1" style={{...S.g,padding:"16px"}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}><h3 style={{fontSize:13,fontWeight:600,margin:0}}>Listeners</h3><span style={{fontSize:11,fontFamily:S.m,color:S.a,background:S.d,padding:"2px 8px",borderRadius:4}}>{listeners}</span></div><p style={{fontSize:12,color:"#475569",textAlign:"center",padding:"8px 0"}}>{listeners===0?"Waiting for listeners...":listeners+" connected"}</p></div>
+              <div className="fi fd2" style={{...S.g,padding:"12px 14px",cursor:cap?"pointer":"default"}} onClick={()=>cap&&setMon(!mon)}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}><div><div style={{fontSize:13,fontWeight:500}}>Monitor</div><div style={{fontSize:11,color:"#64748b"}}>Hear locally</div></div><div style={{width:40,height:22,borderRadius:11,background:mon?"rgba(6,214,160,0.3)":"rgba(255,255,255,0.08)",position:"relative",transition:"background 0.2s"}}><div style={{width:16,height:16,borderRadius:"50%",position:"absolute",top:3,left:mon?21:3,transition:"all 0.2s",background:mon?S.a:"#475569"}}/></div></div></div>
+            </div>
+          </div>
+        ):(
+          // ═══ LISTENER MODE ═══
+          <div style={{maxWidth:440,margin:"0 auto"}}>
+            {!unlocked?(
+              <div className="fi" style={{...S.g,padding:"32px 24px",textAlign:"center",marginBottom:14}}>
+                <p style={{fontSize:16,fontWeight:600,marginBottom:8}}>🎧 DJ Lab Sync</p>
+                <p style={{fontSize:13,color:"#94a3b8",marginBottom:20}}>Tap below to start listening.<br/>Audio will be synced across all devices.</p>
+                <button onClick={unlockAudio} style={{width:"100%",padding:"18px",borderRadius:14,border:"none",background:`linear-gradient(135deg,${S.a},#06b6d4)`,color:"#08090d",fontSize:18,fontWeight:700,fontFamily:S.f,cursor:"pointer",boxShadow:"0 8px 30px rgba(6,214,160,0.3)"}}>🔊 Tap to Start Listening</button>
+                <p style={{fontSize:10,color:"#475569",marginTop:10}}>This unlocks audio on your device</p>
+              </div>
+            ):<>
+            {!hostN&&!live&&(
+              <div className="fi" style={{...S.g,padding:"24px",textAlign:"center",marginBottom:14}}>
+                <p style={{fontSize:14,color:"#94a3b8",marginBottom:16}}>No one is broadcasting yet.</p>
+                <Btn onClick={becomeHost} style={{justifyContent:"center"}}>🎧 Become Host &amp; Broadcast</Btn>
+              </div>
+            )}
+
+            {(hostN||live)&&(
+              <div className="fi" style={{...S.g,padding:"20px",marginBottom:14}}>
+                {playing?(<>
+                  <div style={{textAlign:"center",padding:"12px 0 10px",borderBottom:"1px solid rgba(255,255,255,0.05)",marginBottom:12}}>
+                    <p style={{fontSize:12,color:"#64748b",marginBottom:4}}>Now listening to</p>
+                    <p style={{fontSize:18,fontWeight:700}}>{hostN}</p>
+                  </div>
+                  <Wave analyser={lAn.current} on={true} h={70}/>
+                  <div style={{marginTop:10}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:12,color:"#64748b"}}>Volume</span><span style={{fontSize:11,fontFamily:S.m,color:"#94a3b8"}}>{vol}%</span></div><input type="range" min="0" max="100" value={vol} onChange={e=>setVol(+e.target.value)} style={{width:"100%"}}/></div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginTop:12}}>
+                    <div style={{textAlign:"center",padding:"8px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:14,fontWeight:700,color:S.a,fontFamily:S.m}}>{rtt?rtt+"ms":"—"}</div><div style={{fontSize:9,color:"#64748b"}}>RTT</div></div>
+                    <div style={{textAlign:"center",padding:"8px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:14,fontWeight:700,color:S.a,fontFamily:S.m}}>{syncOff!=null?Math.abs(Math.round(syncOff))+"ms":"—"}</div><div style={{fontSize:9,color:"#64748b"}}>Sync</div></div>
+                    <div style={{textAlign:"center",padding:"8px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:14,fontWeight:700,color:S.a,fontFamily:S.m}}>{BUF_SEC}s</div><div style={{fontSize:9,color:"#64748b"}}>Buffer</div></div>
+                  </div>
+                </>):(
+                  <div style={{textAlign:"center",padding:"20px 0"}}>
+                    <div style={{width:40,height:40,border:"3px solid rgba(6,214,160,0.2)",borderTopColor:S.a,borderRadius:"50%",animation:"spin .8s linear infinite",margin:"0 auto 16px"}}/>
+                    <p style={{fontSize:13,color:"#64748b"}}>{live?"Buffering ("+BUF_SEC+"s)...":"Waiting for "+hostN+" to start..."}</p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {!mode==="host"&&!hostN&&<div style={{textAlign:"center",marginBottom:14}}><Btn onClick={()=>{unlockAudio();becomeHost();}}>🎧 Become Host</Btn></div>}
+
+            <Chat messages={chat} onSend={sendChat} myName={name}/>
+            </>}
+          </div>
+        )}
+
+        <p style={{textAlign:"center",marginTop:20,fontSize:10,color:"#262b35"}}>DJ Lab Sync {sVer||VER} · thedjlab.ca</p>
       </div>
-      {err&&<div style={{padding:"12px 14px",borderRadius:8,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.15)",fontSize:12,color:"#fca5a5",marginBottom:16}}>{err}</div>}
-      {!joined&&!err&&<div style={{textAlign:"center",padding:"30px 0"}}><div style={{width:40,height:40,border:"3px solid rgba(6,214,160,0.2)",borderTopColor:S.a,borderRadius:"50%",animation:"spin .8s linear infinite",margin:"0 auto 16px"}}/><p style={{fontSize:13,color:"#64748b"}}>{!wsOk?"Connecting...":"Joining..."}</p></div>}
-      {joined&&!playing&&!err&&<div style={{textAlign:"center",padding:"24px 0"}}><div style={{width:40,height:40,border:"3px solid rgba(6,214,160,0.2)",borderTopColor:S.a,borderRadius:"50%",animation:"spin .8s linear infinite",margin:"0 auto 16px"}}/><p style={{fontSize:13,color:"#64748b"}}>{live?"Buffering ("+BUF_SEC+"s)...":"Waiting for host..."}</p><p style={{fontSize:11,color:"#475569",marginTop:8}}>Connected to {host}</p></div>}
-      {playing&&<><div style={{textAlign:"center",padding:"14px 0 12px",borderBottom:"1px solid rgba(255,255,255,0.05)",marginBottom:14}}><p style={{fontSize:12,color:"#64748b",marginBottom:4}}>Now listening to</p><p style={{fontSize:18,fontWeight:700}}>{host}</p></div>
-        <div style={{marginBottom:14}}><Wave analyser={anNode.current} on={true} h={70}/></div>
-        <div><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:12,color:"#64748b"}}>Volume</span><span style={{fontSize:11,fontFamily:S.m,color:"#94a3b8"}}>{vol}%</span></div><input type="range" min="0" max="100" value={vol} onChange={e=>setVol(+e.target.value)} style={{width:"100%"}}/></div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginTop:14}}>
-          <div style={{textAlign:"center",padding:"8px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:14,fontWeight:700,color:S.a,fontFamily:S.m}}>{rtt?rtt+"ms":"—"}</div><div style={{fontSize:9,color:"#64748b"}}>RTT</div></div>
-          <div style={{textAlign:"center",padding:"8px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:14,fontWeight:700,color:S.a,fontFamily:S.m}}>{off!=null?Math.abs(Math.round(off))+"ms":"—"}</div><div style={{fontSize:9,color:"#64748b"}}>Sync</div></div>
-          <div style={{textAlign:"center",padding:"8px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:14,fontWeight:700,color:S.a,fontFamily:S.m}}>{BUF_SEC}s</div><div style={{fontSize:9,color:"#64748b"}}>Buffer</div></div>
-        </div></>}
-      <div style={{marginTop:14}}><Chat messages={chat} onSend={sendChat} myName={userName}/></div>
-      <Btn v="secondary" onClick={()=>{ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"leave"}));ctx.current?.close().catch(()=>{});onLeave();}} style={{width:"100%",justifyContent:"center",marginTop:14}}>Leave</Btn>
-    </div></div></div>);
+    </div>
+  );
 }
 
-// ══════════ APP ══════════
-function App(){
-  const ur=new URLSearchParams(location.search).get("room");
-  const[v,setV]=useState(ur?"aj":"land");const[rc,setRc]=useState(ur?ur.toUpperCase():"");const[un]=useState(gn);
-  if(v==="aj")return(<div style={{fontFamily:S.f,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,position:"relative",overflow:"hidden"}}><BG/><div style={{position:"relative",zIndex:1,textAlign:"center",maxWidth:400,width:"100%"}}><Logo big/><div className="fi" style={{...S.g,padding:"32px 24px",marginTop:24}}><p style={{fontSize:14,color:"#94a3b8",marginBottom:6}}>Joining room</p><div style={{fontSize:42,fontWeight:800,fontFamily:S.m,color:S.a,letterSpacing:"0.15em",textShadow:"0 0 30px rgba(6,214,160,0.3)",marginBottom:20}}>{rc}</div><p style={{fontSize:12,color:"#64748b",marginBottom:24}}>as <span style={{color:S.a,fontFamily:S.m}}>{un}</span> · {BUF_SEC}s sync buffer</p><button onClick={()=>{setV("listen");history.replaceState({},"",location.pathname);}} style={{width:"100%",padding:"18px",borderRadius:14,border:"none",background:`linear-gradient(135deg,${S.a},#06b6d4)`,color:"#08090d",fontSize:18,fontWeight:700,fontFamily:S.f,cursor:"pointer",boxShadow:"0 8px 30px rgba(6,214,160,0.3)"}}>🔊 Tap to Join &amp; Listen</button><p style={{fontSize:10,color:"#475569",marginTop:12}}>Tap unlocks audio · <VerBadge/></p></div></div></div>);
-  return<>{v==="land"&&<Landing onHost={n=>{setV("host");}} onJoin={(c,n)=>{setRc(c);setV("listen");history.replaceState({},"",location.pathname);}}/>}{v==="host"&&<Host userName={un} onLeave={()=>{setV("land");setRc("");}}/>}{v==="listen"&&<Listener roomCode={rc} userName={un} onLeave={()=>{setV("land");setRc("");}}/>}</>;
-}
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
 </script>
 </body>
