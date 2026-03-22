@@ -19,7 +19,7 @@ select option{background:#1a1d27;color:#e0e4ec}@keyframes pd{0%,100%{opacity:1}5
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script type="text/babel">
 const{useState,useRef,useEffect}=React;
-const VER="v5.0";
+const VER="v5.1";
 const WS=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";
 const SR=48000;
 const CHUNK=8192;
@@ -238,9 +238,6 @@ function App(){
     // initListenerAudio() called by unlockAudio()
     schedRef.current=setInterval(runScheduler,SCHED_MS);
 
-    // Enumerate audio devices
-    (async()=>{try{const t=await navigator.mediaDevices.getUserMedia({audio:true});t.getTracks().forEach(t=>t.stop());setDevs((await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="audioinput"));}catch(e){}})();
-
     return()=>{w.close();clearInterval(si.current);clearInterval(schedRef.current);clearInterval(hTmr.current);
       if(lCtx.current)lCtx.current.close().catch(()=>{});if(hCtx.current)hCtx.current.close().catch(()=>{});};
   },[]);
@@ -260,6 +257,8 @@ function App(){
     if(!unlocked)unlockAudio();
     ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"host",name}));
     setMode("host");
+    // Enumerate audio devices (only host needs mic access)
+    (async()=>{try{const t=await navigator.mediaDevices.getUserMedia({audio:true});t.getTracks().forEach(t=>t.stop());setDevs((await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="audioinput"));}catch(e){}})();
   }
 
   // ─── Start capture ───
@@ -322,10 +321,13 @@ function App(){
               <Chat messages={chat} onSend={sendChat} myName={name}/>
             </div>
             <div className="rs" style={{display:"flex",flexDirection:"column",gap:14}}>
-              <div className="fi" style={{...S.g,padding:"16px",textAlign:"center"}}>
-                <p style={{fontSize:12,fontWeight:600,color:"#64748b",marginBottom:4}}>Share this URL</p>
-                <div style={{padding:"10px",borderRadius:8,background:"rgba(255,255,255,0.03)",fontSize:11,color:S.a,fontFamily:S.m,wordBreak:"break-all"}}>{location.origin}</div>
-                <p style={{fontSize:10,color:"#475569",marginTop:8}}>Phones go here · {BUF_SEC}s sync buffer</p>
+              <div className="fi" style={{...S.g,padding:"20px",textAlign:"center"}}>
+                <p style={{fontSize:11,color:"#64748b",marginBottom:8,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:600}}>Scan to Listen</p>
+                <div style={{width:160,height:160,margin:"0 auto 10px",background:"#0d1117",borderRadius:12,padding:10,border:"1px solid rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                  <img src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(location.origin)}&bgcolor=08090d&color=06d6a0&format=svg`} alt="QR" style={{width:140,height:140,borderRadius:6}} onError={e=>{e.target.style.display="none"}}/>
+                </div>
+                <div style={{padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,0.03)",fontSize:11,color:S.a,fontFamily:S.m,wordBreak:"break-all",marginBottom:6}}>{location.origin}</div>
+                <p style={{fontSize:10,color:"#475569"}}>{BUF_SEC}s sync buffer</p>
               </div>
               <div className="fi fd1" style={{...S.g,padding:"16px"}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}><h3 style={{fontSize:13,fontWeight:600,margin:0}}>Listeners</h3><span style={{fontSize:11,fontFamily:S.m,color:S.a,background:S.d,padding:"2px 8px",borderRadius:4}}>{listeners}</span></div><p style={{fontSize:12,color:"#475569",textAlign:"center",padding:"8px 0"}}>{listeners===0?"Waiting for listeners...":listeners+" connected"}</p></div>
               <div className="fi fd2" style={{...S.g,padding:"12px 14px",cursor:cap?"pointer":"default"}} onClick={()=>cap&&setMon(!mon)}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}><div><div style={{fontSize:13,fontWeight:500}}>Monitor</div><div style={{fontSize:11,color:"#64748b"}}>Hear locally</div></div><div style={{width:40,height:22,borderRadius:11,background:mon?"rgba(6,214,160,0.3)":"rgba(255,255,255,0.08)",position:"relative",transition:"background 0.2s"}}><div style={{width:16,height:16,borderRadius:"50%",position:"absolute",top:3,left:mon?21:3,transition:"all 0.2s",background:mon?S.a:"#475569"}}/></div></div></div>
@@ -337,7 +339,8 @@ function App(){
             {!unlocked?(
               <div className="fi" style={{...S.g,padding:"32px 24px",textAlign:"center",marginBottom:14}}>
                 <p style={{fontSize:16,fontWeight:600,marginBottom:8}}>🎧 DJ Lab Sync</p>
-                <p style={{fontSize:13,color:"#94a3b8",marginBottom:20}}>Tap below to start listening.<br/>Audio will be synced across all devices.</p>
+                <p style={{fontSize:13,color:"#94a3b8",marginBottom:6}}>Tap below to start listening.</p>
+                <p style={{fontSize:12,color:"#64748b",marginBottom:20}}>Joining as <span style={{color:S.a,fontFamily:S.m,fontWeight:600}}>{name}</span></p>
                 <button onClick={unlockAudio} style={{width:"100%",padding:"18px",borderRadius:14,border:"none",background:`linear-gradient(135deg,${S.a},#06b6d4)`,color:"#08090d",fontSize:18,fontWeight:700,fontFamily:S.f,cursor:"pointer",boxShadow:"0 8px 30px rgba(6,214,160,0.3)"}}>🔊 Tap to Start Listening</button>
                 <p style={{fontSize:10,color:"#475569",marginTop:10}}>This unlocks audio on your device</p>
               </div>
