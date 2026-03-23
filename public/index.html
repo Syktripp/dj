@@ -19,7 +19,7 @@ select option{background:#1a1d27;color:#e0e4ec}@keyframes pd{0%,100%{opacity:1}5
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script type="text/babel">
 const{useState,useRef,useEffect}=React;
-const VER="v6.0";
+const VER="v6.1";
 const WS=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";
 const SR=48000;
 const CHUNK=8192;
@@ -233,26 +233,31 @@ function App() {
   const streamStartRef = useRef(null);
   const writeHeadRef = useRef(0);
   const startedRef = useRef(false);
-  const checkInt = useRef(); // interval to check if we can start playback
+  const firstChunkTimeRef = useRef(null); // server timestamp of first chunk (same for all devices)
 
   // ─── Listener: write chunk to playback worklet ───
+  // Chunks are written SEQUENTIALLY — no gaps, no pops.
+  // Server timestamps are only used for the sync formula, not for ring buffer positioning.
   function writeChunk(serverTime, pcmI16) {
-    const ss = streamStartRef.current;
-    if (ss === null || !lPlayNode.current) return;
+    if (!lPlayNode.current) return;
     const f32 = i2f(pcmI16);
-    const pos = Math.round(((serverTime - ss) / 1000) * SR);
-    // Send to worklet
+
+    // Record first chunk's server time (same value on all devices)
+    if (firstChunkTimeRef.current === null) {
+      firstChunkTimeRef.current = serverTime;
+    }
+
+    // Write sequentially — each chunk goes right after the last, zero gaps
+    const pos = writeHeadRef.current;
     lPlayNode.current.port.postMessage(
       { type: 'write', buf: f32.buffer, pos: pos },
       [f32.buffer]
     );
-    const end = pos + pcmI16.length;
-    if (end > writeHeadRef.current) writeHeadRef.current = end;
+    writeHeadRef.current = pos + pcmI16.length;
 
     // Check if we should start playback
     if (!startedRef.current && ck.current?.ready) {
-      const bufferedSamples = writeHeadRef.current;
-      const bufferedSec = bufferedSamples / SR;
+      const bufferedSec = writeHeadRef.current / SR;
       if (bufferedSec >= BUF_SEC) {
         startPlayback();
       }
@@ -260,16 +265,19 @@ function App() {
   }
 
   // ─── Listener: start playback (called once) ───
+  // SYNC: All devices compute the same readPos because:
+  //   - firstChunkTimeRef is the same (same server timestamp on same chunk)
+  //   - clock.now() is the same (NTP synced)
+  //   - So (clock.now() - firstChunkTime) is the same on all devices
+  //   - Minus BUF_SEC delay, times sample rate = same readPos
   function startPlayback() {
     if (startedRef.current) return;
-    if (!ck.current?.ready || !lPlayNode.current) return;
+    if (!ck.current?.ready || !lPlayNode.current || firstChunkTimeRef.current === null) return;
     startedRef.current = true;
 
-    // THE SYNC FORMULA:
-    // All devices compute the same readPos from the shared streamStart + synced clock
     const serverNow = ck.current.now();
-    const ss = streamStartRef.current;
-    const readPos = Math.max(0, Math.round(((serverNow - ss) / 1000 - BUF_SEC) * SR));
+    const elapsed = (serverNow - firstChunkTimeRef.current) / 1000; // seconds since first chunk
+    const readPos = Math.max(0, Math.round((elapsed - BUF_SEC) * SR));
 
     lPlayNode.current.port.postMessage({ type: 'start', pos: readPos });
     setPlaying(true);
@@ -467,21 +475,22 @@ function App() {
           if (m.live && m.streamStart) {
             streamStartRef.current = m.streamStart;
             writeHeadRef.current = 0;
+            firstChunkTimeRef.current = null;
             startedRef.current = false;
             setPlaying(false);
           }
           if (!m.live) {
             setPlaying(false);
             startedRef.current = false;
+            firstChunkTimeRef.current = null;
             streamStartRef.current = null;
-            // Mute playback worklet
             if (lPlayNode.current) lPlayNode.current.port.postMessage({ type: 'stop' });
           }
           break;
         case "host-changed": setHostN(m.host); break;
         case "host-gone":
           setHostN(""); setLive(false); setPlaying(false);
-          startedRef.current = false; streamStartRef.current = null;
+          startedRef.current = false; firstChunkTimeRef.current = null; streamStartRef.current = null;
           if (lPlayNode.current) lPlayNode.current.port.postMessage({ type: 'stop' });
           break;
         case "l+": setNListeners(m.n); break;
