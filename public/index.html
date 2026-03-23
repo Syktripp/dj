@@ -19,7 +19,7 @@ select option{background:#1a1d27;color:#e0e4ec}@keyframes pd{0%,100%{opacity:1}5
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script type="text/babel">
 const{useState,useRef,useEffect}=React;
-const VER="v7.0";
+const VER="v7.2";
 const WS=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";
 const SR=48000;
 const CHUNK=8192;
@@ -65,7 +65,7 @@ class Clock{
     const useN=Math.max(1,Math.floor(sorted.length/2));
     let sum=0;for(let i=0;i<useN;i++)sum+=sorted[i].off;
     this.offset=sum/useN;this.rtt=rtt;
-    if(this.s.length>=5)this.ready=true;
+    if(this.s.length>=10)this.ready=true;
   }
   now(){return Date.now()+this.offset;}
 }
@@ -118,12 +118,12 @@ function App(){
   const hCtx=useRef();const hAn=useRef();const hStream=useRef();const hWk=useRef();const hMon=useRef();const hT0=useRef();const hTmr=useRef();
   // Listener playback refs
   const lCtx=useRef();const lGain=useRef();const lAn=useRef();
-  // === THE VONAGE APPROACH STATE ===
-  const startTimeRef=useRef(null);  // audioCtx.currentTime of first chunk's scheduled play
-  const chunkCountRef=useRef(0);    // how many chunks received since stream start
-  const firstChunkTRef=useRef(null); // server timestamp of first chunk
-  const bufferingRef=useRef(true);  // true until we've buffered enough chunks
-  const chunkQueueRef=useRef([]);   // queue chunks during buffering phase
+  // === SYNC STATE — all from server, nothing local ===
+  const startTimeRef=useRef(null);   // audioCtx time when seq=1 should play
+  const streamStartRef=useRef(null); // from server, same for all devices
+  const bufferingRef=useRef(true);
+  const chunkQueueRef=useRef([]);    // queued during buffer phase: {f32, seq}
+  const startTimeComputed=useRef(false);
 
   // ─── Listener: play a single chunk at exact time ───
   function playChunk(float32, playTime) {
@@ -137,66 +137,72 @@ function App(){
     src.start(playTime);
   }
 
-  // ─── Listener: handle incoming chunk ───
-  function handleChunk(serverTime, pcmI16) {
+  // ─── Compute startTime ONCE — the shared sync anchor ───
+  // startTime = the audioCtx.currentTime at which seq=1 should play
+  // All devices compute the same value because:
+  //   streamStart is from server (same)
+  //   clock.now() is NTP-synced (same)
+  //   BUF_SEC is constant (same)
+  //   (seq-1)*CHUNK_DUR is from server seq (same)
+  function computeStartTime() {
     const c = lCtx.current;
     const clock = ck.current;
-    if (!c || !clock || !clock.ready) return;
+    const ss = streamStartRef.current;
+    if (!c || !clock || !clock.ready || ss === null) return false;
+    // When should seq=1 play? At streamStart + BUF_SEC seconds (in server time)
+    const targetServerMs = ss + BUF_SEC * 1000;
+    const waitMs = targetServerMs - clock.now();
+    startTimeRef.current = c.currentTime + waitMs / 1000;
+    startTimeComputed.current = true;
+    return true;
+  }
+
+  // ─── Listener: handle incoming chunk ───
+  // seq = server sequence number (same for all devices)
+  // serverTime = server timestamp (used for nothing in playback — only seq matters)
+  function handleChunk(seq, serverTime, pcmI16) {
+    const c = lCtx.current;
+    if (!c || c.state === "closed") return;
+    if (streamStartRef.current === null) return; // no stream active
 
     const f32 = i2f(pcmI16);
 
-    // First chunk: compute startTime
-    if (firstChunkTRef.current === null) {
-      firstChunkTRef.current = serverTime;
-      chunkCountRef.current = 0;
-      bufferingRef.current = true;
-      chunkQueueRef.current = [];
-    }
-
-    // Queue this chunk
-    const idx = chunkCountRef.current;
-    chunkCountRef.current++;
+    // Compute playTime for this chunk: startTime + (seq-1) * CHUNK_DUR
+    // seq starts at 1 from server
 
     if (bufferingRef.current) {
-      chunkQueueRef.current.push({ f32, idx });
+      // Queue during buffering
+      chunkQueueRef.current.push({ f32, seq });
 
-      // Check if we have enough buffered
       const bufferedSec = chunkQueueRef.current.length * CHUNK_DUR;
-      if (bufferedSec >= BUF_SEC) {
-        // COMPUTE startTime — THE SYNC POINT
-        // When should chunk 0 play? At firstChunkServerTime + BUF_SEC (in server time)
-        // How far from now is that? waitMs = target - clock.now()
-        // Convert to audioCtx time: audioCtx.currentTime + waitMs/1000
-        const targetServerTime = firstChunkTRef.current + BUF_SEC * 1000;
-        const waitMs = targetServerTime - clock.now();
-        startTimeRef.current = c.currentTime + waitMs / 1000;
 
-        // Play all queued chunks
+      // Need enough audio AND enough NTP samples
+      if (bufferedSec >= BUF_SEC && ck.current?.ready) {
+        if (!computeStartTime()) return; // NTP not ready yet
+
+        // Flush queue — skip chunks whose playTime is in the past
         bufferingRef.current = false;
         for (const q of chunkQueueRef.current) {
-          const playTime = startTimeRef.current + q.idx * CHUNK_DUR;
-          playChunk(q.f32, playTime);
+          const playTime = startTimeRef.current + (q.seq - 1) * CHUNK_DUR;
+          if (playTime >= c.currentTime - 0.01) playChunk(q.f32, playTime);
         }
         chunkQueueRef.current = [];
         if (!playing) setPlaying(true);
       }
     } else {
-      // After buffering: play immediately at calculated time
-      const playTime = startTimeRef.current + idx * CHUNK_DUR;
-      playChunk(f32, playTime);
+      // After buffering: schedule directly using server seq — skip if past
+      const playTime = startTimeRef.current + (seq - 1) * CHUNK_DUR;
+      if (playTime >= lCtx.current.currentTime - 0.01) playChunk(f32, playTime);
     }
   }
 
   function resetPlayback() {
     startTimeRef.current = null;
-    chunkCountRef.current = 0;
-    firstChunkTRef.current = null;
+    startTimeComputed.current = false;
     bufferingRef.current = true;
     chunkQueueRef.current = [];
     setPlaying(false);
-    // Mute gain to silence any already-scheduled chunks
-    if (lGain.current) { lGain.current.gain.setValueAtTime(0, lCtx.current?.currentTime || 0); }
-    // Restore after a beat
+    if (lGain.current && lCtx.current) { lGain.current.gain.setValueAtTime(0, lCtx.current.currentTime); }
     setTimeout(() => { if (lGain.current && lCtx.current) lGain.current.gain.setValueAtTime(vol/100, lCtx.current.currentTime); }, 200);
   }
 
@@ -264,23 +270,25 @@ function App(){
     w.onopen = () => { setWsOk(true); w.send(JSON.stringify({ type: "listen", name })); };
     w.onerror = () => setWsOk(false); w.onclose = () => setWsOk(false);
     w.onmessage = (e) => {
-      if (e.data instanceof ArrayBuffer) { const { seq, t, pcm } = unpack(e.data); handleChunk(t, pcm); return; }
+      if (e.data instanceof ArrayBuffer) { const { seq, t, pcm } = unpack(e.data); handleChunk(seq, t, pcm); return; }
       const m = JSON.parse(e.data);
       switch (m.type) {
         case "welcome": setSVer(m.version); setHostN(m.host || ""); setLive(m.live); setNL(m.listeners);
+          if (m.streamStart) streamStartRef.current = m.streamStart;
           if (m.chatHistory) setChat(m.chatHistory);
           ck.current = new Clock(o => w.readyState === 1 && w.send(JSON.stringify(o)));
           ck.current.ping(); syncInt.current = setInterval(() => { ck.current?.ping(); setRtt(ck.current?.rtt || null); setSyncOff(ck.current?.offset || null); }, 2000);
           break;
         case "listen-ok": setSVer(m.version); setHostN(m.host || ""); setLive(m.live); setNL(m.n);
+          if (m.streamStart) streamStartRef.current = m.streamStart;
           if (m.chatHistory) setChat(m.chatHistory); break;
         case "host-ok": setSVer(m.version); break;
         case "sync-pong": ck.current?.pong(m); setRtt(ck.current?.rtt || null); setSyncOff(ck.current?.offset || null); break;
         case "live": setLive(m.live);
-          if (m.live) { resetPlayback(); }
-          if (!m.live) { resetPlayback(); } break;
+          if (m.live && m.streamStart) { streamStartRef.current = m.streamStart; resetPlayback(); }
+          if (!m.live) { streamStartRef.current = null; resetPlayback(); } break;
         case "host-changed": setHostN(m.host); break;
-        case "host-gone": setHostN(""); setLive(false); resetPlayback(); break;
+        case "host-gone": setHostN(""); setLive(false); streamStartRef.current = null; resetPlayback(); break;
         case "l+": setNL(m.n); break;
         case "l-": setNL(m.n); break;
         case "chat": setChat(p => [...p, { from: m.from, text: m.text, t: m.t }]); break;
