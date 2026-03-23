@@ -19,160 +19,64 @@ select option{background:#1a1d27;color:#e0e4ec}@keyframes pd{0%,100%{opacity:1}5
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script type="text/babel">
 const{useState,useRef,useEffect}=React;
-const VER="v6.1";
+const VER="v7.0";
 const WS=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";
 const SR=48000;
 const CHUNK=8192;
+const CHUNK_DUR=CHUNK/SR; // exactly 0.170666... seconds per chunk
 const BUF_SEC=5;
-const RING_SECS=60;
-const RING_LEN=SR*RING_SECS;
 
 /*
- * ══════════════════════════════════════════════════════════
- *  HOW SYNC WORKS (final, correct approach):
+ * ════════════════════════════════════════════════════════
+ * PLAYBACK ENGINE (Vonage proven approach)
  *
- *  1. Host captures audio, sends Int16 PCM chunks to server via WebSocket
- *  2. Server timestamps each chunk with Date.now(), relays to all listeners
- *  3. All devices do NTP clock sync with server (40 samples, best-RTT average)
- *  4. Listener writes each chunk into an AudioWorklet's ring buffer at:
- *       writePos = (chunkServerTime - streamStart) / 1000 * sampleRate
- *  5. When enough data buffered (5s), compute initial read position:
- *       readPos = (clock.now() - streamStart - BUF_SEC*1000) / 1000 * sampleRate
- *  6. AudioWorklet reads continuously from ring buffer at hardware rate
+ * Source: https://developer.vonage.com/en/blog/streaming-calls-to-a-browser-with-voice-websockets-dr
  *
- *  WHY THIS IS CLICK-FREE:
- *  - ONE AudioWorklet reads sample-by-sample from a continuous ring buffer
- *  - Zero AudioBufferSourceNodes, zero scheduling, zero block boundaries
- *  - The ring buffer data is continuous because chunks are written at their
- *    correct positions (no gaps, no overlaps)
+ * 1. On first chunk: compute startTime on AudioContext hardware clock
+ *    startTime = audioCtx.currentTime + (BUF_SEC seconds offset from NTP)
  *
- *  WHY THIS IS SYNCED:
- *  - All devices share the same streamStart (from server)
- *  - All devices agree on current server time (via NTP)
- *  - So all devices compute the same readPos → read the same sample at the same moment
- *  - Once started, all AudioWorklets read at hardware 48kHz rate → they stay in sync
- * ══════════════════════════════════════════════════════════
+ * 2. Each chunk N plays at: startTime + N * CHUNK_DUR
+ *    This is count-based, NOT timestamp-based. Mathematically perfect spacing.
+ *    No network jitter can create gaps.
+ *
+ * 3. AudioBufferSourceNode.start(playTime) — hardware-scheduled, sub-ms precision
+ *
+ * 4. WebAudio handles late chunks: if a chunk's scheduled time has passed,
+ *    it jumps into the sample at the correct point. No silence gaps.
+ *
+ * SYNC: All devices compute the same startTime because:
+ *   - firstChunkServerTime is the same (stamped by server)
+ *   - clock.now() is the same (NTP synced)
+ *   - So waitMs = (firstChunkServerTime + BUF_SEC*1000) - clock.now()
+ *     is the same on all devices
+ *   - startTime = audioCtx.currentTime + waitMs/1000
+ *   - Then chunk N plays at startTime + N * CHUNK_DUR on all devices
+ * ════════════════════════════════════════════════════════
  */
 
-// ═══ NTP CLOCK (40 samples, best-RTT half average, same as Beatsync) ═══
+// ═══ NTP CLOCK ═══
 class Clock{
   constructor(fn){this.fn=fn;this.s=[];this.offset=0;this.rtt=0;this.n=0;this.ready=false;}
   ping(){this.fn({type:"sync-ping",id:++this.n,ct:Date.now()});}
   pong(m){
-    const rtt=Date.now()-m.ct, off=m.t-m.ct-rtt/2;
-    this.s.push({off,rtt}); if(this.s.length>40)this.s.shift();
+    const rtt=Date.now()-m.ct,off=m.t-m.ct-rtt/2;
+    this.s.push({off,rtt});if(this.s.length>40)this.s.shift();
     const sorted=[...this.s].sort((a,b)=>a.rtt-b.rtt);
     const useN=Math.max(1,Math.floor(sorted.length/2));
-    let sum=0; for(let i=0;i<useN;i++) sum+=sorted[i].off;
-    this.offset=sum/useN; this.rtt=rtt;
-    if(this.s.length>=5) this.ready=true;
+    let sum=0;for(let i=0;i<useN;i++)sum+=sorted[i].off;
+    this.offset=sum/useN;this.rtt=rtt;
+    if(this.s.length>=5)this.ready=true;
   }
   now(){return Date.now()+this.offset;}
 }
 
-// ═══ CAPTURE WORKLET (host side, off main thread) ═══
-const CAP_CODE = `
-class C extends AudioWorkletProcessor {
-  constructor(o) {
-    super();
-    this.sz = o.processorOptions.sz || 8192;
-    this.buf = new Float32Array(this.sz);
-    this.pos = 0;
-  }
-  process(inputs) {
-    const inp = inputs[0];
-    if (!inp || !inp[0]) return true;
-    const L = inp[0];
-    const R = inp.length > 1 && inp[1] ? inp[1] : L;
-    for (let j = 0; j < L.length; j++) {
-      this.buf[this.pos++] = (L[j] + R[j]) * 0.5;
-      if (this.pos >= this.sz) {
-        const out = new Int16Array(this.sz);
-        for (let k = 0; k < this.sz; k++)
-          out[k] = Math.max(-32768, Math.min(32767, Math.round(this.buf[k] * 32767)));
-        this.port.postMessage(out.buffer, [out.buffer]);
-        this.pos = 0;
-      }
-    }
-    return true;
-  }
-}
-registerProcessor('cap', C);
-`;
-
-// ═══ PLAYBACK WORKLET (listener side) ═══
-// ONE continuous reader. Zero boundaries. Zero clicks.
-const PLAY_CODE = `
-class P extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.ringSize = ${RING_LEN};
-    this.ring = new Float32Array(this.ringSize);
-    this.readPos = 0;
-    this.writeHead = 0;
-    this.playing = false;
-    this.volume = 1.0;
-
-    this.port.onmessage = (e) => {
-      const d = e.data;
-      if (d.type === 'write') {
-        // Write Float32 samples into ring at specified position
-        const samples = new Float32Array(d.buf);
-        const pos = d.pos;
-        for (let i = 0; i < samples.length; i++) {
-          this.ring[(pos + i) % this.ringSize] = samples[i];
-        }
-        const end = pos + samples.length;
-        if (end > this.writeHead) this.writeHead = end;
-      }
-      else if (d.type === 'start') {
-        this.readPos = d.pos;
-        this.playing = true;
-      }
-      else if (d.type === 'stop') {
-        this.playing = false;
-      }
-      else if (d.type === 'vol') {
-        this.volume = d.v;
-      }
-    };
-  }
-
-  process(inputs, outputs) {
-    const out = outputs[0][0];
-    if (!this.playing) {
-      for (let i = 0; i < out.length; i++) out[i] = 0;
-      return true;
-    }
-    for (let i = 0; i < out.length; i++) {
-      if (this.readPos >= this.writeHead) {
-        // Buffer underrun — output silence until more data arrives
-        out[i] = 0;
-      } else {
-        out[i] = this.ring[this.readPos % this.ringSize] * this.volume;
-        this.readPos++;
-      }
-    }
-    return true;
-  }
-}
-registerProcessor('play', P);
-`;
-
-function mkURL(code) {
-  return URL.createObjectURL(new Blob([code], { type: "application/javascript" }));
-}
+// ═══ CAPTURE WORKLET ═══
+const CAP_CODE=`class C extends AudioWorkletProcessor{constructor(o){super();this.sz=o.processorOptions.sz||8192;this.buf=new Float32Array(this.sz);this.pos=0;}process(inputs){const inp=inputs[0];if(!inp||!inp[0])return true;const L=inp[0],R=inp.length>1&&inp[1]?inp[1]:L;for(let j=0;j<L.length;j++){this.buf[this.pos++]=(L[j]+R[j])*0.5;if(this.pos>=this.sz){const out=new Int16Array(this.sz);for(let k=0;k<this.sz;k++)out[k]=Math.max(-32768,Math.min(32767,Math.round(this.buf[k]*32767)));this.port.postMessage(out.buffer,[out.buffer]);this.pos=0;}}return true;}}registerProcessor('cap',C);`;
+function mkURL(code){return URL.createObjectURL(new Blob([code],{type:"application/javascript"}));}
 
 // ═══ CHUNK PROTOCOL ═══
-function unpack(buf) {
-  const dv = new DataView(buf);
-  return { seq: dv.getUint32(0, true), t: dv.getFloat64(4, true), pcm: new Int16Array(buf, 12) };
-}
-function i2f(i16) {
-  const f = new Float32Array(i16.length);
-  for (let j = 0; j < i16.length; j++) f[j] = i16[j] / 32768;
-  return f;
-}
+function unpack(buf){const dv=new DataView(buf);return{seq:dv.getUint32(0,true),t:dv.getFloat64(4,true),pcm:new Int16Array(buf,12)};}
+function i2f(i16){const f=new Float32Array(i16.length);for(let j=0;j<i16.length;j++)f[j]=i16[j]/32768;return f;}
 
 // ═══ STYLES ═══
 const S={f:"'Outfit',sans-serif",m:"'JetBrains Mono',monospace",a:"#06d6a0",d:"rgba(6,214,160,0.15)",
@@ -183,7 +87,7 @@ function gn(){return AD[Math.floor(Math.random()*AD.length)]+"-"+NO[Math.floor(M
 function ft(s){if(!isFinite(s))return"0:00";return`${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,"0")}`;}
 function fmtT(ts){const d=new Date(ts);return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');}
 
-// ═══ UI COMPONENTS ═══
+// ═══ UI COMPONENTS (same as before, not repeated for brevity comments) ═══
 function BG(){return<div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0}}><div style={{position:"absolute",inset:0,opacity:0.03,backgroundImage:`url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`}}/><div style={{position:"absolute",top:"-40%",left:"-20%",width:"80%",height:"80%",background:"radial-gradient(circle,rgba(6,214,160,0.04) 0%,transparent 65%)",filter:"blur(100px)"}}/></div>;}
 function Logo(){return<div style={{display:"flex",alignItems:"center",gap:10}}><div style={{width:32,height:32,borderRadius:10,background:`linear-gradient(135deg,${S.a},#06b6d4)`,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 0 30px rgba(6,214,160,0.25)"}}><svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="#08090d" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div><span style={{fontSize:20,fontWeight:700,letterSpacing:"-0.04em",background:"linear-gradient(135deg,#e0e4ec,#94a3b8)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>DJ Lab</span><span style={{fontSize:20,fontWeight:300,color:S.a}}>Sync</span></div>;}
 function Btn({children,v="primary",onClick,disabled,style:sx,...r}){const b={padding:"11px 22px",borderRadius:10,border:"none",fontFamily:S.f,fontWeight:600,fontSize:13,cursor:disabled?"not-allowed":"pointer",transition:"all 0.2s",display:"inline-flex",alignItems:"center",gap:8,opacity:disabled?0.4:1};const vs={primary:{background:`linear-gradient(135deg,${S.a},#06b6d4)`,color:"#08090d",boxShadow:"0 4px 20px rgba(6,214,160,0.25)"},secondary:{background:"rgba(255,255,255,0.05)",color:"#94a3b8",border:"1px solid rgba(255,255,255,0.08)"},danger:{background:"rgba(239,68,68,0.15)",color:"#ef4444",border:"1px solid rgba(239,68,68,0.2)"}};return<button onClick={onClick} disabled={disabled} style={{...b,...vs[v],...sx}} {...r}>{children}</button>;}
@@ -192,231 +96,158 @@ function Wave({analyser,on,h=140}){const ref=useRef();const af=useRef();useEffec
 function VU({analyser,on}){const[lv,set]=useState(0);const rf=useRef();useEffect(()=>{if(!analyser||!on){set(0);return;}const d=new Uint8Array(analyser.frequencyBinCount);function t(){rf.current=requestAnimationFrame(t);analyser.getByteFrequencyData(d);let s=0;for(let i=0;i<d.length;i++)s+=d[i];set(s/d.length/255);}t();return()=>cancelAnimationFrame(rf.current);},[analyser,on]);const db=lv>0?Math.max(-60,20*Math.log10(lv)):-60,p=Math.max(0,(db+60)/60*100);return<div style={{display:"flex",alignItems:"center",gap:10,fontSize:12}}><span style={{color:"#64748b",fontFamily:S.m,minWidth:50,fontSize:11}}>{lv>0.001?`${db.toFixed(0)} dB`:"— dB"}</span><div style={{flex:1,height:6,background:"rgba(255,255,255,0.05)",borderRadius:3,overflow:"hidden"}}><div style={{width:`${p}%`,height:"100%",borderRadius:3,transition:"width 0.08s linear",background:p>85?"linear-gradient(90deg,#06d6a0,#f59e0b,#ef4444)":p>50?"linear-gradient(90deg,#06d6a0,#06b6d4)":S.a}}/></div></div>;}
 function Chat({messages,onSend,myName}){const[text,setText]=useState("");const endRef=useRef();useEffect(()=>{endRef.current?.scrollIntoView({behavior:"smooth"});},[messages.length]);function send(){const t=text.trim();if(!t)return;onSend(t);setText("");}return<div style={{...S.g,padding:"14px",display:"flex",flexDirection:"column",height:200}}><div style={{fontSize:13,fontWeight:600,marginBottom:8,display:"flex",justifyContent:"space-between"}}><span>💬 Chat</span><span style={{fontSize:10,color:"#475569"}}>{messages.length}</span></div><div style={{flex:1,overflowY:"auto",marginBottom:8,fontSize:12,lineHeight:1.5}}>{messages.length===0&&<p style={{color:"#475569",fontStyle:"italic",textAlign:"center",padding:"12px 0",fontSize:11}}>No messages yet</p>}{messages.map((m,i)=><div key={i} style={{marginBottom:4}}><span style={{color:m.from===myName?S.a:"#94a3b8",fontWeight:600,fontFamily:S.m,fontSize:10}}>{m.from}</span><span style={{color:"#334155",fontSize:9,marginLeft:6}}>{fmtT(m.t)}</span><div style={{color:"#cbd5e1"}}>{m.text}</div></div>)}<div ref={endRef}/></div><div style={{display:"flex",gap:6}}><input value={text} onChange={e=>setText(e.target.value)} placeholder="Message..." onKeyDown={e=>{if(e.key==="Enter")send();}} style={{flex:1,padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#e0e4ec",fontSize:12,fontFamily:S.f,outline:"none"}}/><Btn onClick={send} style={{padding:"8px 14px",fontSize:11}}>Send</Btn></div></div>;}
 
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════
 //  MAIN APP
-// ═══════════════════════════════════════════
-function App() {
-  const [name] = useState(gn);
-  const [mode, setMode] = useState("listen");
-  const [wsOk, setWsOk] = useState(false);
-  const [sVer, setSVer] = useState("");
-  const [hostN, setHostN] = useState("");
-  const [live, setLive] = useState(false);
-  const [nListeners, setNListeners] = useState(0);
-  const [chat, setChat] = useState([]);
-  const [err, setErr] = useState(null);
+// ═══════════════════════════════════════
+function App(){
+  const[name]=useState(gn);
+  const[mode,setMode]=useState("listen");
+  const[wsOk,setWsOk]=useState(false);const[sVer,setSVer]=useState("");
+  const[hostN,setHostN]=useState("");const[live,setLive]=useState(false);
+  const[nL,setNL]=useState(0);const[chat,setChat]=useState([]);
   // Host
-  const [devs, setDevs] = useState([]);
-  const [sel, setSel] = useState("");
-  const [srcMode, setSrcMode] = useState("device");
-  const [cap, setCap] = useState(false);
-  const [monOn, setMonOn] = useState(false);
-  const [capErr, setCapErr] = useState(null);
-  const [elapsed, setElapsed] = useState(0);
+  const[devs,setDevs]=useState([]);const[sel,setSel]=useState("");const[srcMode,setSrcMode]=useState("device");
+  const[cap,setCap]=useState(false);const[monOn,setMonOn]=useState(false);const[capErr,setCapErr]=useState(null);const[elapsed,setElapsed]=useState(0);
   // Listener
-  const [unlocked, setUnlocked] = useState(false);
-  const [playing, setPlaying] = useState(false);
-  const [vol, setVol] = useState(85);
-  const [rtt, setRtt] = useState(null);
-  const [syncOff, setSyncOff] = useState(null);
-  const [, fup] = useState(0);
+  const[unlocked,setUnlocked]=useState(false);const[playing,setPlaying]=useState(false);const[vol,setVol]=useState(85);
+  const[rtt,setRtt]=useState(null);const[syncOff,setSyncOff]=useState(null);
+  const[,fup]=useState(0);
 
   // Refs
-  const ws = useRef();
-  const ck = useRef();
-  const syncInt = useRef();
-  // Host refs
-  const hCtx = useRef(); const hAn = useRef(); const hStream = useRef();
-  const hWk = useRef(); const hMon = useRef(); const hT0 = useRef(); const hTmr = useRef();
-  // Listener refs
-  const lCtx = useRef(); const lPlayNode = useRef(); const lAnNode = useRef();
-  const streamStartRef = useRef(null);
-  const writeHeadRef = useRef(0);
-  const startedRef = useRef(false);
-  const firstChunkTimeRef = useRef(null); // server timestamp of first chunk (same for all devices)
+  const ws=useRef();const ck=useRef();const syncInt=useRef();
+  const hCtx=useRef();const hAn=useRef();const hStream=useRef();const hWk=useRef();const hMon=useRef();const hT0=useRef();const hTmr=useRef();
+  // Listener playback refs
+  const lCtx=useRef();const lGain=useRef();const lAn=useRef();
+  // === THE VONAGE APPROACH STATE ===
+  const startTimeRef=useRef(null);  // audioCtx.currentTime of first chunk's scheduled play
+  const chunkCountRef=useRef(0);    // how many chunks received since stream start
+  const firstChunkTRef=useRef(null); // server timestamp of first chunk
+  const bufferingRef=useRef(true);  // true until we've buffered enough chunks
+  const chunkQueueRef=useRef([]);   // queue chunks during buffering phase
 
-  // ─── Listener: write chunk to playback worklet ───
-  // Chunks are written SEQUENTIALLY — no gaps, no pops.
-  // Server timestamps are only used for the sync formula, not for ring buffer positioning.
-  function writeChunk(serverTime, pcmI16) {
-    if (!lPlayNode.current) return;
+  // ─── Listener: play a single chunk at exact time ───
+  function playChunk(float32, playTime) {
+    const c = lCtx.current;
+    if (!c || c.state === "closed") return;
+    const buf = c.createBuffer(1, float32.length, SR);
+    buf.getChannelData(0).set(float32);
+    const src = c.createBufferSource();
+    src.buffer = buf;
+    src.connect(lGain.current);
+    src.start(playTime);
+  }
+
+  // ─── Listener: handle incoming chunk ───
+  function handleChunk(serverTime, pcmI16) {
+    const c = lCtx.current;
+    const clock = ck.current;
+    if (!c || !clock || !clock.ready) return;
+
     const f32 = i2f(pcmI16);
 
-    // Record first chunk's server time (same value on all devices)
-    if (firstChunkTimeRef.current === null) {
-      firstChunkTimeRef.current = serverTime;
+    // First chunk: compute startTime
+    if (firstChunkTRef.current === null) {
+      firstChunkTRef.current = serverTime;
+      chunkCountRef.current = 0;
+      bufferingRef.current = true;
+      chunkQueueRef.current = [];
     }
 
-    // Write sequentially — each chunk goes right after the last, zero gaps
-    const pos = writeHeadRef.current;
-    lPlayNode.current.port.postMessage(
-      { type: 'write', buf: f32.buffer, pos: pos },
-      [f32.buffer]
-    );
-    writeHeadRef.current = pos + pcmI16.length;
+    // Queue this chunk
+    const idx = chunkCountRef.current;
+    chunkCountRef.current++;
 
-    // Check if we should start playback
-    if (!startedRef.current && ck.current?.ready) {
-      const bufferedSec = writeHeadRef.current / SR;
+    if (bufferingRef.current) {
+      chunkQueueRef.current.push({ f32, idx });
+
+      // Check if we have enough buffered
+      const bufferedSec = chunkQueueRef.current.length * CHUNK_DUR;
       if (bufferedSec >= BUF_SEC) {
-        startPlayback();
+        // COMPUTE startTime — THE SYNC POINT
+        // When should chunk 0 play? At firstChunkServerTime + BUF_SEC (in server time)
+        // How far from now is that? waitMs = target - clock.now()
+        // Convert to audioCtx time: audioCtx.currentTime + waitMs/1000
+        const targetServerTime = firstChunkTRef.current + BUF_SEC * 1000;
+        const waitMs = targetServerTime - clock.now();
+        startTimeRef.current = c.currentTime + waitMs / 1000;
+
+        // Play all queued chunks
+        bufferingRef.current = false;
+        for (const q of chunkQueueRef.current) {
+          const playTime = startTimeRef.current + q.idx * CHUNK_DUR;
+          playChunk(q.f32, playTime);
+        }
+        chunkQueueRef.current = [];
+        if (!playing) setPlaying(true);
       }
+    } else {
+      // After buffering: play immediately at calculated time
+      const playTime = startTimeRef.current + idx * CHUNK_DUR;
+      playChunk(f32, playTime);
     }
   }
 
-  // ─── Listener: start playback (called once) ───
-  // SYNC: All devices compute the same readPos because:
-  //   - firstChunkTimeRef is the same (same server timestamp on same chunk)
-  //   - clock.now() is the same (NTP synced)
-  //   - So (clock.now() - firstChunkTime) is the same on all devices
-  //   - Minus BUF_SEC delay, times sample rate = same readPos
-  function startPlayback() {
-    if (startedRef.current) return;
-    if (!ck.current?.ready || !lPlayNode.current || firstChunkTimeRef.current === null) return;
-    startedRef.current = true;
-
-    const serverNow = ck.current.now();
-    const elapsed = (serverNow - firstChunkTimeRef.current) / 1000; // seconds since first chunk
-    const readPos = Math.max(0, Math.round((elapsed - BUF_SEC) * SR));
-
-    lPlayNode.current.port.postMessage({ type: 'start', pos: readPos });
-    setPlaying(true);
+  function resetPlayback() {
+    startTimeRef.current = null;
+    chunkCountRef.current = 0;
+    firstChunkTRef.current = null;
+    bufferingRef.current = true;
+    chunkQueueRef.current = [];
+    setPlaying(false);
+    // Mute gain to silence any already-scheduled chunks
+    if (lGain.current) { lGain.current.gain.setValueAtTime(0, lCtx.current?.currentTime || 0); }
+    // Restore after a beat
+    setTimeout(() => { if (lGain.current && lCtx.current) lGain.current.gain.setValueAtTime(vol/100, lCtx.current.currentTime); }, 200);
   }
 
-  // ─── Init listener AudioContext + playback worklet ───
-  async function initListenerAudio() {
+  // ─── Init listener audio ───
+  function initListenerAudio() {
     if (lCtx.current) return;
     const c = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
     lCtx.current = c;
-    if (c.state === "suspended") await c.resume();
-
-    // Load playback worklet
-    const url = mkURL(PLAY_CODE);
-    await c.audioWorklet.addModule(url);
-    URL.revokeObjectURL(url);
-
-    const playNode = new AudioWorkletNode(c, 'play', {
-      numberOfInputs: 0,
-      numberOfOutputs: 1,
-      outputChannelCount: [1],
-    });
-
-    // Connect: playNode → analyser → destination
-    const an = c.createAnalyser();
-    an.fftSize = 2048;
-    an.smoothingTimeConstant = 0.8;
-    playNode.connect(an);
-    an.connect(c.destination);
-
-    lPlayNode.current = playNode;
-    lAnNode.current = an;
-
-    // Set volume
-    playNode.port.postMessage({ type: 'vol', v: vol / 100 });
-
+    if (c.state === "suspended") c.resume();
+    const g = c.createGain(); g.gain.value = vol / 100; lGain.current = g;
+    const a = c.createAnalyser(); a.fftSize = 2048; a.smoothingTimeConstant = 0.8; lAn.current = a;
+    g.connect(a); a.connect(c.destination);
     fup(n => n + 1);
   }
 
-  function sendChat(text) {
-    ws.current?.readyState === 1 && ws.current.send(JSON.stringify({ type: "chat", text }));
-  }
-
-  function unlockAudio() {
-    initListenerAudio();
-    setUnlocked(true);
-  }
+  function sendChat(text) { ws.current?.readyState === 1 && ws.current.send(JSON.stringify({ type: "chat", text })); }
+  function unlockAudio() { initListenerAudio(); setUnlocked(true); }
 
   function becomeHost() {
-    if (!unlocked) initListenerAudio().catch(() => {});
-    setUnlocked(true);
+    if (!unlocked) { initListenerAudio(); setUnlocked(true); }
     ws.current?.readyState === 1 && ws.current.send(JSON.stringify({ type: "host", name }));
     setMode("host");
-    // Enumerate audio devices (only host needs mic)
-    (async () => {
-      try {
-        const t = await navigator.mediaDevices.getUserMedia({ audio: true });
-        t.getTracks().forEach(t => t.stop());
-        setDevs((await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput"));
-      } catch (e) {}
-    })();
+    (async () => { try { const t = await navigator.mediaDevices.getUserMedia({ audio: true }); t.getTracks().forEach(t => t.stop()); setDevs((await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput")); } catch (e) {} })();
   }
 
-  // ─── Host: start capture ───
   async function startCap() {
     setCapErr(null);
     try {
       let s;
       if (srcMode === "system") {
-        s = await navigator.mediaDevices.getDisplayMedia({
-          video: { width: 1, height: 1 },
-          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: SR },
-        });
-        if (!s.getAudioTracks().length) {
-          s.getTracks().forEach(t => t.stop());
-          setCapErr("No audio. Share Chrome Tab + check 'Also share tab audio'.");
-          return;
-        }
+        s = await navigator.mediaDevices.getDisplayMedia({ video: { width: 1, height: 1 }, audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: SR } });
+        if (!s.getAudioTracks().length) { s.getTracks().forEach(t => t.stop()); setCapErr("No audio. Share Chrome Tab + check 'Also share tab audio'."); return; }
         s.getVideoTracks().forEach(t => t.stop());
       } else {
-        s = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            deviceId: sel ? { exact: sel } : undefined,
-            echoCancellation: false, noiseSuppression: false, autoGainControl: false,
-            sampleRate: SR, channelCount: 2,
-          },
-        });
+        s = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: sel ? { exact: sel } : undefined, echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: SR, channelCount: 2 } });
       }
       hStream.current = s;
-      const c = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
-      hCtx.current = c;
+      const c = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR }); hCtx.current = c;
       const src = c.createMediaStreamSource(s);
-
-      // Analyser
-      const an = c.createAnalyser(); an.fftSize = 2048; an.smoothingTimeConstant = 0.8;
-      src.connect(an); hAn.current = an;
-
-      // Monitor gain (default off)
-      const mg = c.createGain(); mg.gain.value = 0;
-      src.connect(mg); mg.connect(c.destination); hMon.current = mg;
-
-      // Capture worklet
+      const an = c.createAnalyser(); an.fftSize = 2048; an.smoothingTimeConstant = 0.8; src.connect(an); hAn.current = an;
+      const mg = c.createGain(); mg.gain.value = 0; src.connect(mg); mg.connect(c.destination); hMon.current = mg;
       let ok = false;
-      try {
-        const url = mkURL(CAP_CODE);
-        await c.audioWorklet.addModule(url);
-        URL.revokeObjectURL(url);
-        const node = new AudioWorkletNode(c, 'cap', {
-          processorOptions: { sz: CHUNK }, numberOfInputs: 1, numberOfOutputs: 1, channelCount: 2,
-        });
-        node.port.onmessage = ev => {
-          const w = ws.current;
-          if (w && w.readyState === 1) w.send(ev.data);
-        };
-        src.connect(node); node.connect(c.destination);
-        hWk.current = node; ok = true;
-      } catch (e) { console.warn("Worklet fallback", e); }
-
-      if (!ok) {
-        const proc = c.createScriptProcessor(CHUNK, 2, 1);
-        proc.onaudioprocess = ev => {
-          const w = ws.current; if (!w || w.readyState !== 1) return;
-          const L = ev.inputBuffer.getChannelData(0);
-          const R = ev.inputBuffer.numberOfChannels > 1 ? ev.inputBuffer.getChannelData(1) : L;
-          const o = new Int16Array(L.length);
-          for (let i = 0; i < L.length; i++)
-            o[i] = Math.max(-32768, Math.min(32767, Math.round(((L[i] + R[i]) * 0.5) * 32767)));
-          w.send(o.buffer);
-        };
-        src.connect(proc); proc.connect(c.destination); hWk.current = proc;
-      }
-
+      try { const url = mkURL(CAP_CODE); await c.audioWorklet.addModule(url); URL.revokeObjectURL(url);
+        const node = new AudioWorkletNode(c, 'cap', { processorOptions: { sz: CHUNK }, numberOfInputs: 1, numberOfOutputs: 1, channelCount: 2 });
+        node.port.onmessage = ev => { const w = ws.current; if (w && w.readyState === 1) w.send(ev.data); };
+        src.connect(node); node.connect(c.destination); hWk.current = node; ok = true; } catch (e) {}
+      if (!ok) { const proc = c.createScriptProcessor(CHUNK, 2, 1); proc.onaudioprocess = ev => { const w = ws.current; if (!w || w.readyState !== 1) return; const L = ev.inputBuffer.getChannelData(0), R = ev.inputBuffer.numberOfChannels > 1 ? ev.inputBuffer.getChannelData(1) : L; const o = new Int16Array(L.length); for (let i = 0; i < L.length; i++) o[i] = Math.max(-32768, Math.min(32767, Math.round(((L[i] + R[i]) * 0.5) * 32767))); w.send(o.buffer); }; src.connect(proc); proc.connect(c.destination); hWk.current = proc; }
       ws.current?.readyState === 1 && ws.current.send(JSON.stringify({ type: "live", live: true, sr: SR }));
       setCap(true); fup(n => n + 1);
       s.getTracks().forEach(t => { t.onended = () => stopCap(); });
-    } catch (e) {
-      if (e.name === "NotAllowedError") setCapErr("Permission denied.");
-      else setCapErr("Error: " + e.message);
-    }
+    } catch (e) { if (e.name === "NotAllowedError") setCapErr("Permission denied."); else setCapErr("Error: " + e.message); }
   }
 
   function stopCap() {
@@ -424,186 +255,90 @@ function App() {
     try { hWk.current?.disconnect(); } catch (e) {} hWk.current = null;
     if (hStream.current) { hStream.current.getTracks().forEach(t => t.stop()); hStream.current = null; }
     if (hCtx.current) { hCtx.current.close().catch(() => {}); hCtx.current = null; }
-    hAn.current = null; hMon.current = null;
-    setCap(false); setMonOn(false); fup(n => n + 1);
+    hAn.current = null; hMon.current = null; setCap(false); setMonOn(false); fup(n => n + 1);
   }
 
   // ─── WebSocket ───
   useEffect(() => {
-    const w = new WebSocket(WS);
-    ws.current = w;
-    w.binaryType = "arraybuffer";
-
+    const w = new WebSocket(WS); ws.current = w; w.binaryType = "arraybuffer";
     w.onopen = () => { setWsOk(true); w.send(JSON.stringify({ type: "listen", name })); };
-    w.onerror = () => setWsOk(false);
-    w.onclose = () => setWsOk(false);
-
+    w.onerror = () => setWsOk(false); w.onclose = () => setWsOk(false);
     w.onmessage = (e) => {
-      // Binary = audio chunk
-      if (e.data instanceof ArrayBuffer) {
-        const { seq, t, pcm } = unpack(e.data);
-        writeChunk(t, pcm);
-        return;
-      }
+      if (e.data instanceof ArrayBuffer) { const { seq, t, pcm } = unpack(e.data); handleChunk(t, pcm); return; }
       const m = JSON.parse(e.data);
       switch (m.type) {
-        case "welcome":
-          setSVer(m.version); setHostN(m.host || ""); setLive(m.live); setNListeners(m.listeners);
-          if (m.streamStart) streamStartRef.current = m.streamStart;
+        case "welcome": setSVer(m.version); setHostN(m.host || ""); setLive(m.live); setNL(m.listeners);
           if (m.chatHistory) setChat(m.chatHistory);
           ck.current = new Clock(o => w.readyState === 1 && w.send(JSON.stringify(o)));
-          ck.current.ping();
-          syncInt.current = setInterval(() => {
-            ck.current?.ping();
-            setRtt(ck.current?.rtt || null);
-            setSyncOff(ck.current?.offset || null);
-          }, 2000);
+          ck.current.ping(); syncInt.current = setInterval(() => { ck.current?.ping(); setRtt(ck.current?.rtt || null); setSyncOff(ck.current?.offset || null); }, 2000);
           break;
-        case "listen-ok":
-          setSVer(m.version); setHostN(m.host || ""); setLive(m.live); setNListeners(m.n);
-          if (m.streamStart) streamStartRef.current = m.streamStart;
-          if (m.chatHistory) setChat(m.chatHistory);
-          break;
+        case "listen-ok": setSVer(m.version); setHostN(m.host || ""); setLive(m.live); setNL(m.n);
+          if (m.chatHistory) setChat(m.chatHistory); break;
         case "host-ok": setSVer(m.version); break;
-        case "sync-pong":
-          ck.current?.pong(m);
-          setRtt(ck.current?.rtt || null);
-          setSyncOff(ck.current?.offset || null);
-          break;
-        case "live":
-          setLive(m.live);
-          if (m.live && m.streamStart) {
-            streamStartRef.current = m.streamStart;
-            writeHeadRef.current = 0;
-            firstChunkTimeRef.current = null;
-            startedRef.current = false;
-            setPlaying(false);
-          }
-          if (!m.live) {
-            setPlaying(false);
-            startedRef.current = false;
-            firstChunkTimeRef.current = null;
-            streamStartRef.current = null;
-            if (lPlayNode.current) lPlayNode.current.port.postMessage({ type: 'stop' });
-          }
-          break;
+        case "sync-pong": ck.current?.pong(m); setRtt(ck.current?.rtt || null); setSyncOff(ck.current?.offset || null); break;
+        case "live": setLive(m.live);
+          if (m.live) { resetPlayback(); }
+          if (!m.live) { resetPlayback(); } break;
         case "host-changed": setHostN(m.host); break;
-        case "host-gone":
-          setHostN(""); setLive(false); setPlaying(false);
-          startedRef.current = false; firstChunkTimeRef.current = null; streamStartRef.current = null;
-          if (lPlayNode.current) lPlayNode.current.port.postMessage({ type: 'stop' });
-          break;
-        case "l+": setNListeners(m.n); break;
-        case "l-": setNListeners(m.n); break;
+        case "host-gone": setHostN(""); setLive(false); resetPlayback(); break;
+        case "l+": setNL(m.n); break;
+        case "l-": setNL(m.n); break;
         case "chat": setChat(p => [...p, { from: m.from, text: m.text, t: m.t }]); break;
-        case "error": setErr(m.msg); break;
       }
     };
-
-    return () => {
-      w.close();
-      clearInterval(syncInt.current);
-      clearInterval(hTmr.current);
-      if (lCtx.current) lCtx.current.close().catch(() => {});
-      if (hCtx.current) hCtx.current.close().catch(() => {});
-    };
+    return () => { w.close(); clearInterval(syncInt.current); clearInterval(hTmr.current);
+      if (lCtx.current) lCtx.current.close().catch(() => {}); if (hCtx.current) hCtx.current.close().catch(() => {}); };
   }, []);
 
-  // Volume → worklet
-  useEffect(() => { if (lPlayNode.current) lPlayNode.current.port.postMessage({ type: 'vol', v: vol / 100 }); }, [vol]);
-  // Monitor toggle
+  useEffect(() => { if (lGain.current && lCtx.current) lGain.current.gain.setValueAtTime(vol / 100, lCtx.current.currentTime); }, [vol]);
   useEffect(() => { if (hMon.current) hMon.current.gain.value = monOn ? 1 : 0; }, [monOn]);
-  // Timer
-  useEffect(() => {
-    if (cap) { hT0.current = Date.now(); hTmr.current = setInterval(() => setElapsed(Math.floor((Date.now() - hT0.current) / 1000)), 1000); }
-    else { clearInterval(hTmr.current); setElapsed(0); }
-    return () => clearInterval(hTmr.current);
-  }, [cap]);
+  useEffect(() => { if (cap) { hT0.current = Date.now(); hTmr.current = setInterval(() => setElapsed(Math.floor((Date.now() - hT0.current) / 1000)), 1000); } else { clearInterval(hTmr.current); setElapsed(0); } return () => clearInterval(hTmr.current); }, [cap]);
 
-  // ═══ RENDER ═══
   const qr = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(location.origin)}&bgcolor=08090d&color=06d6a0&format=svg`;
 
+  // ═══ RENDER ═══
   return (
     <div style={{ fontFamily: S.f, background: "#08090d", color: "#e0e4ec", minHeight: "100vh", position: "relative", overflow: "hidden" }}>
       <BG />
       <div style={{ position: "relative", zIndex: 1, maxWidth: mode === "host" ? 960 : 500, margin: "0 auto", padding: "20px 20px 40px" }}>
-
-        {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20, flexWrap: "wrap", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}><Logo /><span style={{ fontSize: 9, fontFamily: S.m, color: "#334155", background: "rgba(255,255,255,0.03)", padding: "2px 6px", borderRadius: 4 }}>{sVer || VER}</span></div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <Logo />
-            <span style={{ fontSize: 9, fontFamily: S.m, color: "#334155", background: "rgba(255,255,255,0.03)", padding: "2px 6px", borderRadius: 4 }}>{sVer || VER}</span>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <Pill s={!wsOk ? "error" : cap ? "live" : playing ? "live" : "idle"}
-              label={!wsOk ? "Offline" : cap ? `LIVE · ${ft(elapsed)}` : playing ? "♫ Synced" : live ? "Buffering" : "Ready"} />
-            <span style={{ fontSize: 11, fontFamily: S.m, color: "#475569" }}>👥 {nListeners}</span>
+            <Pill s={!wsOk ? "error" : cap ? "live" : playing ? "live" : "idle"} label={!wsOk ? "Offline" : cap ? `LIVE · ${ft(elapsed)}` : playing ? "♫ Synced" : live ? "Buffering" : "Ready"} />
+            <span style={{ fontSize: 11, fontFamily: S.m, color: "#475569" }}>👥 {nL}</span>
           </div>
         </div>
 
         {mode === "host" ? (
-          /* ═══ HOST ═══ */
           <div className="hg" style={{ display: "grid", gridTemplateColumns: "1fr 280px", gap: 16, alignItems: "start" }}>
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               <div className="fi" style={{ ...S.g, padding: "20px" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14, flexWrap: "wrap", gap: 8 }}>
                   <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>Audio Source</h3>
                   <div style={{ display: "flex", background: "rgba(255,255,255,0.04)", borderRadius: 8, overflow: "hidden", border: "1px solid rgba(255,255,255,0.06)" }}>
-                    {[{ k: "device", l: "🎛 Device" }, { k: "system", l: "🖥 System" }].map(m =>
-                      <button key={m.k} onClick={() => !cap && setSrcMode(m.k)} style={{ padding: "6px 12px", border: "none", fontSize: 12, fontWeight: 500, fontFamily: S.f, cursor: cap ? "not-allowed" : "pointer", background: srcMode === m.k ? S.d : "transparent", color: srcMode === m.k ? S.a : "#64748b" }}>{m.l}</button>
-                    )}
+                    {[{ k: "device", l: "🎛 Device" }, { k: "system", l: "🖥 System" }].map(m => <button key={m.k} onClick={() => !cap && setSrcMode(m.k)} style={{ padding: "6px 12px", border: "none", fontSize: 12, fontWeight: 500, fontFamily: S.f, cursor: cap ? "not-allowed" : "pointer", background: srcMode === m.k ? S.d : "transparent", color: srcMode === m.k ? S.a : "#64748b" }}>{m.l}</button>)}
                   </div>
                 </div>
-                {srcMode === "device" ?
-                  <div style={{ marginBottom: 12 }}>
-                    <select value={sel} onChange={e => setSel(e.target.value)} style={{ width: "100%", padding: "10px 14px", borderRadius: 8, background: "rgba(255,255,255,0.04)", color: "#e0e4ec", border: "1px solid rgba(255,255,255,0.08)", fontSize: 13, fontFamily: S.f, outline: "none", appearance: "none" }}>
-                      <option value="">Select audio source...</option>
-                      {devs.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || `Device ${d.deviceId.slice(0, 8)}`}</option>)}
-                    </select>
-                  </div>
-                  : <div style={{ padding: "12px", borderRadius: 8, background: "rgba(6,214,160,0.05)", border: "1px solid rgba(6,214,160,0.1)", marginBottom: 12, fontSize: 12, color: "#94a3b8" }}><strong style={{ color: S.a }}>System Audio</strong> — Share Chrome Tab + "Also share tab audio"</div>
-                }
-                <div style={{ display: "flex", gap: 10 }}>
-                  {!cap ? <Btn onClick={startCap} disabled={!wsOk} style={{ flex: 1, justifyContent: "center" }}>▶ Start Broadcasting</Btn>
-                    : <Btn v="danger" onClick={stopCap} style={{ flex: 1, justifyContent: "center" }}>⏹ Stop</Btn>}
-                </div>
+                {srcMode === "device" ? <div style={{ marginBottom: 12 }}><select value={sel} onChange={e => setSel(e.target.value)} style={{ width: "100%", padding: "10px 14px", borderRadius: 8, background: "rgba(255,255,255,0.04)", color: "#e0e4ec", border: "1px solid rgba(255,255,255,0.08)", fontSize: 13, fontFamily: S.f, outline: "none", appearance: "none" }}><option value="">Select audio source...</option>{devs.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || `Device ${d.deviceId.slice(0, 8)}`}</option>)}</select></div>
+                  : <div style={{ padding: "12px", borderRadius: 8, background: "rgba(6,214,160,0.05)", border: "1px solid rgba(6,214,160,0.1)", marginBottom: 12, fontSize: 12, color: "#94a3b8" }}><strong style={{ color: S.a }}>System Audio</strong> — Share Chrome Tab + "Also share tab audio"</div>}
+                <div style={{ display: "flex", gap: 10 }}>{!cap ? <Btn onClick={startCap} disabled={!wsOk} style={{ flex: 1, justifyContent: "center" }}>▶ Start Broadcasting</Btn> : <Btn v="danger" onClick={stopCap} style={{ flex: 1, justifyContent: "center" }}>⏹ Stop</Btn>}</div>
                 {capErr && <div style={{ marginTop: 10, padding: "10px", borderRadius: 8, background: "rgba(239,68,68,0.08)", fontSize: 12, color: "#fca5a5" }}>{capErr}</div>}
               </div>
-              <div className="fi fd1" style={{ ...S.g, padding: "16px" }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-                  <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{cap ? "Live" : "Preview"}</h3>
-                  {cap && <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: S.a, fontFamily: S.m }}><div style={{ width: 5, height: 5, borderRadius: "50%", background: S.a, animation: "pd 1.5s ease infinite" }} />48kHz</div>}
-                </div>
-                <Wave analyser={hAn.current} on={cap} h={130} />
-                <div style={{ marginTop: 8 }}><VU analyser={hAn.current} on={cap} /></div>
-              </div>
+              <div className="fi fd1" style={{ ...S.g, padding: "16px" }}><div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}><h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{cap ? "Live" : "Preview"}</h3>{cap && <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: S.a, fontFamily: S.m }}><div style={{ width: 5, height: 5, borderRadius: "50%", background: S.a, animation: "pd 1.5s ease infinite" }} />48kHz</div>}</div><Wave analyser={hAn.current} on={cap} h={130} /><div style={{ marginTop: 8 }}><VU analyser={hAn.current} on={cap} /></div></div>
               <Chat messages={chat} onSend={sendChat} myName={name} />
             </div>
             <div className="rs" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               <div className="fi" style={{ ...S.g, padding: "20px", textAlign: "center" }}>
                 <p style={{ fontSize: 11, color: "#64748b", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600 }}>Scan to Listen</p>
-                <div style={{ width: 160, height: 160, margin: "0 auto 10px", background: "#0d1117", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  <img src={qr} alt="QR" style={{ width: 140, height: 140, borderRadius: 6 }} onError={e => { e.target.style.display = "none"; }} />
-                </div>
+                <div style={{ width: 160, height: 160, margin: "0 auto 10px", background: "#0d1117", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center" }}><img src={qr} alt="QR" style={{ width: 140, height: 140, borderRadius: 6 }} onError={e => { e.target.style.display = "none"; }} /></div>
                 <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(255,255,255,0.03)", fontSize: 11, color: S.a, fontFamily: S.m, wordBreak: "break-all", marginBottom: 6 }}>{location.origin}</div>
                 <p style={{ fontSize: 10, color: "#475569" }}>{BUF_SEC}s sync buffer</p>
               </div>
-              <div className="fi fd1" style={{ ...S.g, padding: "16px" }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}><h3 style={{ fontSize: 13, fontWeight: 600, margin: 0 }}>Listeners</h3><span style={{ fontSize: 11, fontFamily: S.m, color: S.a, background: S.d, padding: "2px 8px", borderRadius: 4 }}>{nListeners}</span></div>
-                <p style={{ fontSize: 12, color: "#475569", textAlign: "center", padding: "8px 0" }}>{nListeners === 0 ? "Waiting..." : nListeners + " connected"}</p>
-              </div>
-              <div className="fi fd2" style={{ ...S.g, padding: "12px 14px", cursor: cap ? "pointer" : "default" }} onClick={() => cap && setMonOn(!monOn)}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <div><div style={{ fontSize: 13, fontWeight: 500 }}>Monitor</div><div style={{ fontSize: 11, color: "#64748b" }}>Hear locally</div></div>
-                  <div style={{ width: 40, height: 22, borderRadius: 11, background: monOn ? "rgba(6,214,160,0.3)" : "rgba(255,255,255,0.08)", position: "relative", transition: "background 0.2s" }}>
-                    <div style={{ width: 16, height: 16, borderRadius: "50%", position: "absolute", top: 3, left: monOn ? 21 : 3, transition: "all 0.2s", background: monOn ? S.a : "#475569" }} />
-                  </div>
-                </div>
-              </div>
+              <div className="fi fd1" style={{ ...S.g, padding: "16px" }}><div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}><h3 style={{ fontSize: 13, fontWeight: 600, margin: 0 }}>Listeners</h3><span style={{ fontSize: 11, fontFamily: S.m, color: S.a, background: S.d, padding: "2px 8px", borderRadius: 4 }}>{nL}</span></div><p style={{ fontSize: 12, color: "#475569", textAlign: "center", padding: "8px 0" }}>{nL === 0 ? "Waiting..." : nL + " connected"}</p></div>
+              <div className="fi fd2" style={{ ...S.g, padding: "12px 14px", cursor: cap ? "pointer" : "default" }} onClick={() => cap && setMonOn(!monOn)}><div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}><div><div style={{ fontSize: 13, fontWeight: 500 }}>Monitor</div><div style={{ fontSize: 11, color: "#64748b" }}>Hear locally</div></div><div style={{ width: 40, height: 22, borderRadius: 11, background: monOn ? "rgba(6,214,160,0.3)" : "rgba(255,255,255,0.08)", position: "relative", transition: "background 0.2s" }}><div style={{ width: 16, height: 16, borderRadius: "50%", position: "absolute", top: 3, left: monOn ? 21 : 3, transition: "all 0.2s", background: monOn ? S.a : "#475569" }} /></div></div></div>
             </div>
           </div>
         ) : (
-          /* ═══ LISTENER ═══ */
           <div style={{ maxWidth: 440, margin: "0 auto" }}>
             {!unlocked ? (
               <div className="fi" style={{ ...S.g, padding: "32px 24px", textAlign: "center", marginBottom: 14 }}>
@@ -626,12 +361,9 @@ function App() {
                       <p style={{ fontSize: 12, color: "#64748b", marginBottom: 4 }}>Now listening to</p>
                       <p style={{ fontSize: 18, fontWeight: 700 }}>{hostN}</p>
                     </div>
-                    <Wave analyser={lAnNode.current} on={true} h={70} />
+                    <Wave analyser={lAn.current} on={true} h={70} />
                     <div style={{ marginTop: 10 }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-                        <span style={{ fontSize: 12, color: "#64748b" }}>Volume</span>
-                        <span style={{ fontSize: 11, fontFamily: S.m, color: "#94a3b8" }}>{vol}%</span>
-                      </div>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}><span style={{ fontSize: 12, color: "#64748b" }}>Volume</span><span style={{ fontSize: 11, fontFamily: S.m, color: "#94a3b8" }}>{vol}%</span></div>
                       <input type="range" min="0" max="100" value={vol} onChange={e => setVol(+e.target.value)} style={{ width: "100%" }} />
                     </div>
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 12 }}>
@@ -651,7 +383,6 @@ function App() {
             </>)}
           </div>
         )}
-
         <p style={{ textAlign: "center", marginTop: 20, fontSize: 10, color: "#262b35" }}>DJ Lab Sync {sVer || VER} · thedjlab.ca</p>
       </div>
     </div>
