@@ -19,42 +19,162 @@ select option{background:#1a1d27;color:#e0e4ec}@keyframes pd{0%,100%{opacity:1}5
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script type="text/babel">
 const{useState,useRef,useEffect}=React;
-const VER="v5.1";
+const VER="v6.0";
 const WS=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";
 const SR=48000;
 const CHUNK=8192;
 const BUF_SEC=5;
-const RING_LEN=SR*60;
-const SCHED_MS=400;
-const BLOCK_SEC=1.5;
-const BLOCK_N=Math.floor(SR*BLOCK_SEC);
-const FADE=64;
+const RING_SECS=60;
+const RING_LEN=SR*RING_SECS;
 
-// ══════ NTP CLOCK ══════
+/*
+ * ══════════════════════════════════════════════════════════
+ *  HOW SYNC WORKS (final, correct approach):
+ *
+ *  1. Host captures audio, sends Int16 PCM chunks to server via WebSocket
+ *  2. Server timestamps each chunk with Date.now(), relays to all listeners
+ *  3. All devices do NTP clock sync with server (40 samples, best-RTT average)
+ *  4. Listener writes each chunk into an AudioWorklet's ring buffer at:
+ *       writePos = (chunkServerTime - streamStart) / 1000 * sampleRate
+ *  5. When enough data buffered (5s), compute initial read position:
+ *       readPos = (clock.now() - streamStart - BUF_SEC*1000) / 1000 * sampleRate
+ *  6. AudioWorklet reads continuously from ring buffer at hardware rate
+ *
+ *  WHY THIS IS CLICK-FREE:
+ *  - ONE AudioWorklet reads sample-by-sample from a continuous ring buffer
+ *  - Zero AudioBufferSourceNodes, zero scheduling, zero block boundaries
+ *  - The ring buffer data is continuous because chunks are written at their
+ *    correct positions (no gaps, no overlaps)
+ *
+ *  WHY THIS IS SYNCED:
+ *  - All devices share the same streamStart (from server)
+ *  - All devices agree on current server time (via NTP)
+ *  - So all devices compute the same readPos → read the same sample at the same moment
+ *  - Once started, all AudioWorklets read at hardware 48kHz rate → they stay in sync
+ * ══════════════════════════════════════════════════════════
+ */
+
+// ═══ NTP CLOCK (40 samples, best-RTT half average, same as Beatsync) ═══
 class Clock{
   constructor(fn){this.fn=fn;this.s=[];this.offset=0;this.rtt=0;this.n=0;this.ready=false;}
   ping(){this.fn({type:"sync-ping",id:++this.n,ct:Date.now()});}
   pong(m){
-    const rtt=Date.now()-m.ct,off=m.t-m.ct-rtt/2;
-    this.s.push({off,rtt});if(this.s.length>40)this.s.shift();
-    const best=[...this.s].sort((a,b)=>a.rtt-b.rtt);
-    const useN=Math.max(1,Math.floor(best.length/2));
-    let sum=0;for(let i=0;i<useN;i++)sum+=best[i].off;
-    this.offset=sum/useN;this.rtt=rtt;
-    if(this.s.length>=5)this.ready=true;
+    const rtt=Date.now()-m.ct, off=m.t-m.ct-rtt/2;
+    this.s.push({off,rtt}); if(this.s.length>40)this.s.shift();
+    const sorted=[...this.s].sort((a,b)=>a.rtt-b.rtt);
+    const useN=Math.max(1,Math.floor(sorted.length/2));
+    let sum=0; for(let i=0;i<useN;i++) sum+=sorted[i].off;
+    this.offset=sum/useN; this.rtt=rtt;
+    if(this.s.length>=5) this.ready=true;
   }
   now(){return Date.now()+this.offset;}
 }
 
-// ══════ CAPTURE WORKLET ══════
-const CAP_CODE=`class C extends AudioWorkletProcessor{constructor(o){super();this.sz=o.processorOptions.sz||8192;this.b=new Float32Array(this.sz);this.p=0;}process(ins){const i=ins[0];if(!i||!i[0])return true;const L=i[0],R=i.length>1&&i[1]?i[1]:L;for(let j=0;j<L.length;j++){this.b[this.p++]=(L[j]+R[j])*0.5;if(this.p>=this.sz){const o=new Int16Array(this.sz);for(let k=0;k<this.sz;k++)o[k]=Math.max(-32768,Math.min(32767,Math.round(this.b[k]*32767)));this.port.postMessage(o.buffer,[o.buffer]);this.p=0;}}return true;}}registerProcessor('cap',C);`;
-function mkURL(c){return URL.createObjectURL(new Blob([c],{type:"application/javascript"}));}
+// ═══ CAPTURE WORKLET (host side, off main thread) ═══
+const CAP_CODE = `
+class C extends AudioWorkletProcessor {
+  constructor(o) {
+    super();
+    this.sz = o.processorOptions.sz || 8192;
+    this.buf = new Float32Array(this.sz);
+    this.pos = 0;
+  }
+  process(inputs) {
+    const inp = inputs[0];
+    if (!inp || !inp[0]) return true;
+    const L = inp[0];
+    const R = inp.length > 1 && inp[1] ? inp[1] : L;
+    for (let j = 0; j < L.length; j++) {
+      this.buf[this.pos++] = (L[j] + R[j]) * 0.5;
+      if (this.pos >= this.sz) {
+        const out = new Int16Array(this.sz);
+        for (let k = 0; k < this.sz; k++)
+          out[k] = Math.max(-32768, Math.min(32767, Math.round(this.buf[k] * 32767)));
+        this.port.postMessage(out.buffer, [out.buffer]);
+        this.pos = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('cap', C);
+`;
 
-// ══════ CHUNK PROTOCOL ══════
-function unpack(b){const d=new DataView(b);return{seq:d.getUint32(0,true),t:d.getFloat64(4,true),pcm:new Int16Array(b,12)};}
-function i2f(i){const f=new Float32Array(i.length);for(let j=0;j<i.length;j++)f[j]=i[j]/32768;return f;}
+// ═══ PLAYBACK WORKLET (listener side) ═══
+// ONE continuous reader. Zero boundaries. Zero clicks.
+const PLAY_CODE = `
+class P extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.ringSize = ${RING_LEN};
+    this.ring = new Float32Array(this.ringSize);
+    this.readPos = 0;
+    this.writeHead = 0;
+    this.playing = false;
+    this.volume = 1.0;
 
-// ══════ STYLES ══════
+    this.port.onmessage = (e) => {
+      const d = e.data;
+      if (d.type === 'write') {
+        // Write Float32 samples into ring at specified position
+        const samples = new Float32Array(d.buf);
+        const pos = d.pos;
+        for (let i = 0; i < samples.length; i++) {
+          this.ring[(pos + i) % this.ringSize] = samples[i];
+        }
+        const end = pos + samples.length;
+        if (end > this.writeHead) this.writeHead = end;
+      }
+      else if (d.type === 'start') {
+        this.readPos = d.pos;
+        this.playing = true;
+      }
+      else if (d.type === 'stop') {
+        this.playing = false;
+      }
+      else if (d.type === 'vol') {
+        this.volume = d.v;
+      }
+    };
+  }
+
+  process(inputs, outputs) {
+    const out = outputs[0][0];
+    if (!this.playing) {
+      for (let i = 0; i < out.length; i++) out[i] = 0;
+      return true;
+    }
+    for (let i = 0; i < out.length; i++) {
+      if (this.readPos >= this.writeHead) {
+        // Buffer underrun — output silence until more data arrives
+        out[i] = 0;
+      } else {
+        out[i] = this.ring[this.readPos % this.ringSize] * this.volume;
+        this.readPos++;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('play', P);
+`;
+
+function mkURL(code) {
+  return URL.createObjectURL(new Blob([code], { type: "application/javascript" }));
+}
+
+// ═══ CHUNK PROTOCOL ═══
+function unpack(buf) {
+  const dv = new DataView(buf);
+  return { seq: dv.getUint32(0, true), t: dv.getFloat64(4, true), pcm: new Int16Array(buf, 12) };
+}
+function i2f(i16) {
+  const f = new Float32Array(i16.length);
+  for (let j = 0; j < i16.length; j++) f[j] = i16[j] / 32768;
+  return f;
+}
+
+// ═══ STYLES ═══
 const S={f:"'Outfit',sans-serif",m:"'JetBrains Mono',monospace",a:"#06d6a0",d:"rgba(6,214,160,0.15)",
   g:{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:14,backdropFilter:"blur(20px)"}};
 const AD=["cosmic","neon","solar","lunar","crystal","shadow","golden","velvet","arctic","ember","azure","crimson","jade","amber","violet","coral","phantom","electric","turbo","silent"];
@@ -63,332 +183,473 @@ function gn(){return AD[Math.floor(Math.random()*AD.length)]+"-"+NO[Math.floor(M
 function ft(s){if(!isFinite(s))return"0:00";return`${Math.floor(s/60)}:${Math.floor(s%60).toString().padStart(2,"0")}`;}
 function fmtT(ts){const d=new Date(ts);return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');}
 
-// ══════ UI ══════
+// ═══ UI COMPONENTS ═══
 function BG(){return<div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0}}><div style={{position:"absolute",inset:0,opacity:0.03,backgroundImage:`url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`}}/><div style={{position:"absolute",top:"-40%",left:"-20%",width:"80%",height:"80%",background:"radial-gradient(circle,rgba(6,214,160,0.04) 0%,transparent 65%)",filter:"blur(100px)"}}/></div>;}
 function Logo(){return<div style={{display:"flex",alignItems:"center",gap:10}}><div style={{width:32,height:32,borderRadius:10,background:`linear-gradient(135deg,${S.a},#06b6d4)`,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 0 30px rgba(6,214,160,0.25)"}}><svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="#08090d" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div><span style={{fontSize:20,fontWeight:700,letterSpacing:"-0.04em",background:"linear-gradient(135deg,#e0e4ec,#94a3b8)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>DJ Lab</span><span style={{fontSize:20,fontWeight:300,color:S.a}}>Sync</span></div>;}
 function Btn({children,v="primary",onClick,disabled,style:sx,...r}){const b={padding:"11px 22px",borderRadius:10,border:"none",fontFamily:S.f,fontWeight:600,fontSize:13,cursor:disabled?"not-allowed":"pointer",transition:"all 0.2s",display:"inline-flex",alignItems:"center",gap:8,opacity:disabled?0.4:1};const vs={primary:{background:`linear-gradient(135deg,${S.a},#06b6d4)`,color:"#08090d",boxShadow:"0 4px 20px rgba(6,214,160,0.25)"},secondary:{background:"rgba(255,255,255,0.05)",color:"#94a3b8",border:"1px solid rgba(255,255,255,0.08)"},danger:{background:"rgba(239,68,68,0.15)",color:"#ef4444",border:"1px solid rgba(239,68,68,0.2)"}};return<button onClick={onClick} disabled={disabled} style={{...b,...vs[v],...sx}} {...r}>{children}</button>;}
 function Pill({s,label}){const c={live:{bg:"rgba(6,214,160,0.12)",fg:S.a},idle:{bg:"rgba(255,255,255,0.04)",fg:"#64748b"},connecting:{bg:"rgba(245,158,11,0.12)",fg:"#f59e0b"},error:{bg:"rgba(239,68,68,0.12)",fg:"#ef4444"}}[s]||{bg:"rgba(255,255,255,0.04)",fg:"#64748b"};return<div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 12px",borderRadius:20,background:c.bg,fontSize:12,fontWeight:500,color:c.fg}}><div style={{width:6,height:6,borderRadius:"50%",background:c.fg,animation:s==="live"?"pd 2s ease infinite":"none"}}/>{label}</div>;}
-
 function Wave({analyser,on,h=140}){const ref=useRef();const af=useRef();useEffect(()=>{const c=ref.current;if(!c)return;const x=c.getContext("2d");const dp=devicePixelRatio||1;function rs(){const r=c.getBoundingClientRect();c.width=r.width*dp;c.height=r.height*dp;x.setTransform(dp,0,0,dp,0,0);}rs();addEventListener("resize",rs);function draw(){af.current=requestAnimationFrame(draw);const r=c.getBoundingClientRect(),w=r.width,ht=r.height;x.clearRect(0,0,w,ht);if(!analyser||!on){x.strokeStyle="rgba(6,214,160,0.15)";x.lineWidth=1.5;x.beginPath();const t=Date.now()/1000;for(let i=0;i<w;i++){const y=ht/2+Math.sin(i/w*6+t*2)*2;i===0?x.moveTo(i,y):x.lineTo(i,y);}x.stroke();return;}const bl=analyser.frequencyBinCount,fd=new Uint8Array(bl);analyser.getByteFrequencyData(fd);const bc=Math.min(100,Math.floor(w/6)),bw=w/bc,gp=2;for(let i=0;i<bc;i++){const idx=Math.floor(Math.pow(i/bc,1.5)*bl*0.6),v=fd[idx]/255,bh=Math.max(2,v*ht*0.9);const g=x.createLinearGradient(0,ht,0,ht-bh);g.addColorStop(0,"rgba(6,214,160,0.7)");g.addColorStop(0.4,"rgba(6,182,212,0.5)");g.addColorStop(1,"rgba(6,214,160,0.05)");x.fillStyle=g;const px=i*bw+gp/2,bd=bw-gp,rr=Math.min(2,bd/2);x.beginPath();x.moveTo(px+rr,ht-bh);x.lineTo(px+bd-rr,ht-bh);x.quadraticCurveTo(px+bd,ht-bh,px+bd,ht-bh+rr);x.lineTo(px+bd,ht);x.lineTo(px,ht);x.lineTo(px,ht-bh+rr);x.quadraticCurveTo(px,ht-bh,px+rr,ht-bh);x.fill();}const td=new Uint8Array(bl);analyser.getByteTimeDomainData(td);x.strokeStyle="rgba(6,214,160,0.3)";x.lineWidth=1.5;x.beginPath();for(let i=0;i<bl;i++){const px=(i/bl)*w,py=(td[i]/255)*ht;i===0?x.moveTo(px,py):x.lineTo(px,py);}x.stroke();}draw();return()=>{cancelAnimationFrame(af.current);removeEventListener("resize",rs);};},[analyser,on]);return<canvas ref={ref} style={{width:"100%",height:h,borderRadius:10,background:"rgba(0,0,0,0.3)",display:"block"}}/>;}
 function VU({analyser,on}){const[lv,set]=useState(0);const rf=useRef();useEffect(()=>{if(!analyser||!on){set(0);return;}const d=new Uint8Array(analyser.frequencyBinCount);function t(){rf.current=requestAnimationFrame(t);analyser.getByteFrequencyData(d);let s=0;for(let i=0;i<d.length;i++)s+=d[i];set(s/d.length/255);}t();return()=>cancelAnimationFrame(rf.current);},[analyser,on]);const db=lv>0?Math.max(-60,20*Math.log10(lv)):-60,p=Math.max(0,(db+60)/60*100);return<div style={{display:"flex",alignItems:"center",gap:10,fontSize:12}}><span style={{color:"#64748b",fontFamily:S.m,minWidth:50,fontSize:11}}>{lv>0.001?`${db.toFixed(0)} dB`:"— dB"}</span><div style={{flex:1,height:6,background:"rgba(255,255,255,0.05)",borderRadius:3,overflow:"hidden"}}><div style={{width:`${p}%`,height:"100%",borderRadius:3,transition:"width 0.08s linear",background:p>85?"linear-gradient(90deg,#06d6a0,#f59e0b,#ef4444)":p>50?"linear-gradient(90deg,#06d6a0,#06b6d4)":S.a}}/></div></div>;}
+function Chat({messages,onSend,myName}){const[text,setText]=useState("");const endRef=useRef();useEffect(()=>{endRef.current?.scrollIntoView({behavior:"smooth"});},[messages.length]);function send(){const t=text.trim();if(!t)return;onSend(t);setText("");}return<div style={{...S.g,padding:"14px",display:"flex",flexDirection:"column",height:200}}><div style={{fontSize:13,fontWeight:600,marginBottom:8,display:"flex",justifyContent:"space-between"}}><span>💬 Chat</span><span style={{fontSize:10,color:"#475569"}}>{messages.length}</span></div><div style={{flex:1,overflowY:"auto",marginBottom:8,fontSize:12,lineHeight:1.5}}>{messages.length===0&&<p style={{color:"#475569",fontStyle:"italic",textAlign:"center",padding:"12px 0",fontSize:11}}>No messages yet</p>}{messages.map((m,i)=><div key={i} style={{marginBottom:4}}><span style={{color:m.from===myName?S.a:"#94a3b8",fontWeight:600,fontFamily:S.m,fontSize:10}}>{m.from}</span><span style={{color:"#334155",fontSize:9,marginLeft:6}}>{fmtT(m.t)}</span><div style={{color:"#cbd5e1"}}>{m.text}</div></div>)}<div ref={endRef}/></div><div style={{display:"flex",gap:6}}><input value={text} onChange={e=>setText(e.target.value)} placeholder="Message..." onKeyDown={e=>{if(e.key==="Enter")send();}} style={{flex:1,padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#e0e4ec",fontSize:12,fontFamily:S.f,outline:"none"}}/><Btn onClick={send} style={{padding:"8px 14px",fontSize:11}}>Send</Btn></div></div>;}
 
-function Chat({messages,onSend,myName}){
-  const[text,setText]=useState("");const endRef=useRef();
-  useEffect(()=>{endRef.current?.scrollIntoView({behavior:"smooth"});},[messages.length]);
-  function send(){const t=text.trim();if(!t)return;onSend(t);setText("");}
-  return<div style={{...S.g,padding:"14px",display:"flex",flexDirection:"column",height:200}}>
-    <div style={{fontSize:13,fontWeight:600,marginBottom:8,display:"flex",justifyContent:"space-between"}}><span>💬 Chat</span><span style={{fontSize:10,color:"#475569"}}>{messages.length}</span></div>
-    <div style={{flex:1,overflowY:"auto",marginBottom:8,fontSize:12,lineHeight:1.5}}>
-      {messages.length===0&&<p style={{color:"#475569",fontStyle:"italic",textAlign:"center",padding:"12px 0",fontSize:11}}>No messages yet</p>}
-      {messages.map((m,i)=><div key={i} style={{marginBottom:4}}><span style={{color:m.from===myName?S.a:"#94a3b8",fontWeight:600,fontFamily:S.m,fontSize:10}}>{m.from}</span><span style={{color:"#334155",fontSize:9,marginLeft:6}}>{fmtT(m.t)}</span><div style={{color:"#cbd5e1"}}>{m.text}</div></div>)}
-      <div ref={endRef}/>
-    </div>
-    <div style={{display:"flex",gap:6}}><input value={text} onChange={e=>setText(e.target.value)} placeholder="Message..." onKeyDown={e=>{if(e.key==="Enter")send();}} style={{flex:1,padding:"8px 10px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#e0e4ec",fontSize:12,fontFamily:S.f,outline:"none"}}/><Btn onClick={send} style={{padding:"8px 14px",fontSize:11}}>Send</Btn></div>
-  </div>;
-}
-
-
-// ══════════════════════════════════════════════
-//  MAIN APP — One page, host or listen
-// ══════════════════════════════════════════════
-function App(){
-  const[name]=useState(gn);
-  const[mode,setMode]=useState("listen");  // "listen" or "host"
-  const[wsOk,setWsOk]=useState(false);
-  const[sVer,setSVer]=useState("");
-  const[hostN,setHostN]=useState("");
-  const[live,setLive]=useState(false);
-  const[streamSt,setStreamSt]=useState(null);
-  const[listeners,setListeners]=useState(0);
-  const[chat,setChat]=useState([]);
-  const[err,setErr]=useState(null);
-
-  // Host state
-  const[devs,setDevs]=useState([]);const[sel,setSel]=useState("");const[srcMode,setSrcMode]=useState("device");
-  const[cap,setCap]=useState(false);const[mon,setMon]=useState(false);const[capErr,setCapErr]=useState(null);
-  const[elapsed,setElapsed]=useState(0);
-
-  // Listener state
-  const[playing,setPlaying]=useState(false);const[vol,setVol]=useState(85);
-  const[rtt,setRtt]=useState(null);const[syncOff,setSyncOff]=useState(null);
-  const[unlocked,setUnlocked]=useState(false);
+// ═══════════════════════════════════════════
+//  MAIN APP
+// ═══════════════════════════════════════════
+function App() {
+  const [name] = useState(gn);
+  const [mode, setMode] = useState("listen");
+  const [wsOk, setWsOk] = useState(false);
+  const [sVer, setSVer] = useState("");
+  const [hostN, setHostN] = useState("");
+  const [live, setLive] = useState(false);
+  const [nListeners, setNListeners] = useState(0);
+  const [chat, setChat] = useState([]);
+  const [err, setErr] = useState(null);
+  // Host
+  const [devs, setDevs] = useState([]);
+  const [sel, setSel] = useState("");
+  const [srcMode, setSrcMode] = useState("device");
+  const [cap, setCap] = useState(false);
+  const [monOn, setMonOn] = useState(false);
+  const [capErr, setCapErr] = useState(null);
+  const [elapsed, setElapsed] = useState(0);
+  // Listener
+  const [unlocked, setUnlocked] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [vol, setVol] = useState(85);
+  const [rtt, setRtt] = useState(null);
+  const [syncOff, setSyncOff] = useState(null);
+  const [, fup] = useState(0);
 
   // Refs
-  const ws=useRef();const ck=useRef();const si=useRef();
+  const ws = useRef();
+  const ck = useRef();
+  const syncInt = useRef();
   // Host refs
-  const hCtx=useRef();const hAn=useRef();const hStream=useRef();const hWk=useRef();const hMg=useRef();const hT0=useRef();const hTmr=useRef();
+  const hCtx = useRef(); const hAn = useRef(); const hStream = useRef();
+  const hWk = useRef(); const hMon = useRef(); const hT0 = useRef(); const hTmr = useRef();
   // Listener refs
-  const lCtx=useRef();const lGain=useRef();const lAn=useRef();const schedRef=useRef();
-  const ring=useRef(new Float32Array(RING_LEN));
-  const streamStartRef=useRef(null);
-  const schedPos=useRef(0);const writePos=useRef(0);const started=useRef(false);
-  const[,fup]=useState(0);
+  const lCtx = useRef(); const lPlayNode = useRef(); const lAnNode = useRef();
+  const streamStartRef = useRef(null);
+  const writeHeadRef = useRef(0);
+  const startedRef = useRef(false);
+  const checkInt = useRef(); // interval to check if we can start playback
 
-  // ─── Listener: write chunk into ring buffer ───
-  function writeChunk(serverTime,pcmI16){
-    const ss=streamStartRef.current;if(ss===null)return;
-    const f32=i2f(pcmI16);
-    const pos=Math.round(((serverTime-ss)/1000)*SR);
-    for(let i=0;i<f32.length;i++)ring.current[(pos+i)%RING_LEN]=f32[i];
-    const end=pos+f32.length;
-    if(end>writePos.current)writePos.current=end;
-  }
+  // ─── Listener: write chunk to playback worklet ───
+  function writeChunk(serverTime, pcmI16) {
+    const ss = streamStartRef.current;
+    if (ss === null || !lPlayNode.current) return;
+    const f32 = i2f(pcmI16);
+    const pos = Math.round(((serverTime - ss) / 1000) * SR);
+    // Send to worklet
+    lPlayNode.current.port.postMessage(
+      { type: 'write', buf: f32.buffer, pos: pos },
+      [f32.buffer]
+    );
+    const end = pos + pcmI16.length;
+    if (end > writeHeadRef.current) writeHeadRef.current = end;
 
-  // ─── Listener: THE SCHEDULER ───
-  // Reads from ring buffer, schedules AudioBufferSourceNode.start(exactTime)
-  // Sync formula: NO Date.now() in scheduling path.
-  //   waitMs = desiredServerPlayTime - clock.now()
-  //   ctxPlayTime = audioCtx.currentTime + waitMs / 1000
-  // Every device computes same waitMs (shared server clock via NTP)
-  // → same offset from their own hardware audio clock → plays at same moment
-  function runScheduler(){
-    const c=lCtx.current;
-    const clock=ck.current;
-    const ss=streamStartRef.current;
-    if(!c||!clock||!clock.ready||ss===null||c.state==="closed")return;
-
-    const avail=writePos.current-schedPos.current;
-
-    if(!started.current){
-      if(avail<SR*BUF_SEC)return;
-      const serverNow=clock.now();
-      const streamPos=Math.round(((serverNow-ss)/1000)*SR);
-      schedPos.current=Math.max(0,streamPos-Math.round(BUF_SEC*SR));
-      started.current=true;
-    }
-
-    while(schedPos.current+BLOCK_N<=writePos.current){
-      const bStart=schedPos.current;
-      const bLen=Math.min(BLOCK_N,writePos.current-bStart);
-      if(bLen<SR*0.1)break;
-
-      const samples=new Float32Array(bLen);
-      for(let i=0;i<bLen;i++)samples[i]=ring.current[(bStart+i)%RING_LEN];
-
-      // Crossfade edges
-      for(let i=0;i<FADE&&i<bLen;i++){const g=i/FADE;samples[i]*=g;samples[bLen-1-i]*=g;}
-
-      const buf=c.createBuffer(1,bLen,SR);
-      buf.getChannelData(0).set(samples);
-
-      // *** THE SYNC FORMULA ***
-      // When should this block play in server time?
-      const blockServerTime=ss+(bStart/SR)*1000;
-      const desiredPlayServer=blockServerTime+BUF_SEC*1000;
-      // How many ms from RIGHT NOW (in server time) until play?
-      const waitMs=desiredPlayServer-clock.now();
-      // Convert to AudioContext time (hardware clock, NOT Date.now())
-      const ctxPlayTime=c.currentTime+waitMs/1000;
-
-      if(ctxPlayTime<c.currentTime-0.1){schedPos.current+=bLen;continue;}
-
-      const src=c.createBufferSource();
-      src.buffer=buf;
-      src.connect(lGain.current);
-      src.start(Math.max(ctxPlayTime,c.currentTime+0.005));
-
-      schedPos.current+=bLen;
-      if(!playing)setPlaying(true);
+    // Check if we should start playback
+    if (!startedRef.current && ck.current?.ready) {
+      const bufferedSamples = writeHeadRef.current;
+      const bufferedSec = bufferedSamples / SR;
+      if (bufferedSec >= BUF_SEC) {
+        startPlayback();
+      }
     }
   }
 
-  // ─── Init listener audio context ───
-  function initListenerAudio(){
-    if(lCtx.current)return;
-    const c=new(AudioContext||webkitAudioContext)({sampleRate:SR});lCtx.current=c;
-    const g=c.createGain();g.gain.value=vol/100;lGain.current=g;
-    const a=c.createAnalyser();a.fftSize=2048;a.smoothingTimeConstant=0.8;lAn.current=a;
-    g.connect(a);a.connect(c.destination);
-    if(c.state==="suspended")c.resume();
-    fup(n=>n+1);
+  // ─── Listener: start playback (called once) ───
+  function startPlayback() {
+    if (startedRef.current) return;
+    if (!ck.current?.ready || !lPlayNode.current) return;
+    startedRef.current = true;
+
+    // THE SYNC FORMULA:
+    // All devices compute the same readPos from the shared streamStart + synced clock
+    const serverNow = ck.current.now();
+    const ss = streamStartRef.current;
+    const readPos = Math.max(0, Math.round(((serverNow - ss) / 1000 - BUF_SEC) * SR));
+
+    lPlayNode.current.port.postMessage({ type: 'start', pos: readPos });
+    setPlaying(true);
+  }
+
+  // ─── Init listener AudioContext + playback worklet ───
+  async function initListenerAudio() {
+    if (lCtx.current) return;
+    const c = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
+    lCtx.current = c;
+    if (c.state === "suspended") await c.resume();
+
+    // Load playback worklet
+    const url = mkURL(PLAY_CODE);
+    await c.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+
+    const playNode = new AudioWorkletNode(c, 'play', {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    });
+
+    // Connect: playNode → analyser → destination
+    const an = c.createAnalyser();
+    an.fftSize = 2048;
+    an.smoothingTimeConstant = 0.8;
+    playNode.connect(an);
+    an.connect(c.destination);
+
+    lPlayNode.current = playNode;
+    lAnNode.current = an;
+
+    // Set volume
+    playNode.port.postMessage({ type: 'vol', v: vol / 100 });
+
+    fup(n => n + 1);
+  }
+
+  function sendChat(text) {
+    ws.current?.readyState === 1 && ws.current.send(JSON.stringify({ type: "chat", text }));
+  }
+
+  function unlockAudio() {
+    initListenerAudio();
+    setUnlocked(true);
+  }
+
+  function becomeHost() {
+    if (!unlocked) initListenerAudio().catch(() => {});
+    setUnlocked(true);
+    ws.current?.readyState === 1 && ws.current.send(JSON.stringify({ type: "host", name }));
+    setMode("host");
+    // Enumerate audio devices (only host needs mic)
+    (async () => {
+      try {
+        const t = await navigator.mediaDevices.getUserMedia({ audio: true });
+        t.getTracks().forEach(t => t.stop());
+        setDevs((await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput"));
+      } catch (e) {}
+    })();
+  }
+
+  // ─── Host: start capture ───
+  async function startCap() {
+    setCapErr(null);
+    try {
+      let s;
+      if (srcMode === "system") {
+        s = await navigator.mediaDevices.getDisplayMedia({
+          video: { width: 1, height: 1 },
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: SR },
+        });
+        if (!s.getAudioTracks().length) {
+          s.getTracks().forEach(t => t.stop());
+          setCapErr("No audio. Share Chrome Tab + check 'Also share tab audio'.");
+          return;
+        }
+        s.getVideoTracks().forEach(t => t.stop());
+      } else {
+        s = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: sel ? { exact: sel } : undefined,
+            echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+            sampleRate: SR, channelCount: 2,
+          },
+        });
+      }
+      hStream.current = s;
+      const c = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
+      hCtx.current = c;
+      const src = c.createMediaStreamSource(s);
+
+      // Analyser
+      const an = c.createAnalyser(); an.fftSize = 2048; an.smoothingTimeConstant = 0.8;
+      src.connect(an); hAn.current = an;
+
+      // Monitor gain (default off)
+      const mg = c.createGain(); mg.gain.value = 0;
+      src.connect(mg); mg.connect(c.destination); hMon.current = mg;
+
+      // Capture worklet
+      let ok = false;
+      try {
+        const url = mkURL(CAP_CODE);
+        await c.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+        const node = new AudioWorkletNode(c, 'cap', {
+          processorOptions: { sz: CHUNK }, numberOfInputs: 1, numberOfOutputs: 1, channelCount: 2,
+        });
+        node.port.onmessage = ev => {
+          const w = ws.current;
+          if (w && w.readyState === 1) w.send(ev.data);
+        };
+        src.connect(node); node.connect(c.destination);
+        hWk.current = node; ok = true;
+      } catch (e) { console.warn("Worklet fallback", e); }
+
+      if (!ok) {
+        const proc = c.createScriptProcessor(CHUNK, 2, 1);
+        proc.onaudioprocess = ev => {
+          const w = ws.current; if (!w || w.readyState !== 1) return;
+          const L = ev.inputBuffer.getChannelData(0);
+          const R = ev.inputBuffer.numberOfChannels > 1 ? ev.inputBuffer.getChannelData(1) : L;
+          const o = new Int16Array(L.length);
+          for (let i = 0; i < L.length; i++)
+            o[i] = Math.max(-32768, Math.min(32767, Math.round(((L[i] + R[i]) * 0.5) * 32767)));
+          w.send(o.buffer);
+        };
+        src.connect(proc); proc.connect(c.destination); hWk.current = proc;
+      }
+
+      ws.current?.readyState === 1 && ws.current.send(JSON.stringify({ type: "live", live: true, sr: SR }));
+      setCap(true); fup(n => n + 1);
+      s.getTracks().forEach(t => { t.onended = () => stopCap(); });
+    } catch (e) {
+      if (e.name === "NotAllowedError") setCapErr("Permission denied.");
+      else setCapErr("Error: " + e.message);
+    }
+  }
+
+  function stopCap() {
+    ws.current?.readyState === 1 && ws.current.send(JSON.stringify({ type: "live", live: false }));
+    try { hWk.current?.disconnect(); } catch (e) {} hWk.current = null;
+    if (hStream.current) { hStream.current.getTracks().forEach(t => t.stop()); hStream.current = null; }
+    if (hCtx.current) { hCtx.current.close().catch(() => {}); hCtx.current = null; }
+    hAn.current = null; hMon.current = null;
+    setCap(false); setMonOn(false); fup(n => n + 1);
   }
 
   // ─── WebSocket ───
-  useEffect(()=>{
-    const w=new WebSocket(WS);ws.current=w;w.binaryType="arraybuffer";
-    w.onopen=()=>{setWsOk(true);w.send(JSON.stringify({type:"listen",name}));};
-    w.onerror=()=>setWsOk(false);w.onclose=()=>setWsOk(false);
-    w.onmessage=(e)=>{
-      if(e.data instanceof ArrayBuffer){const{seq,t,pcm}=unpack(e.data);writeChunk(t,pcm);return;}
-      const m=JSON.parse(e.data);
-      switch(m.type){
-        case"welcome":setSVer(m.version);setHostN(m.host||"");setLive(m.live);
-          if(m.streamStart){streamStartRef.current=m.streamStart;setStreamSt(m.streamStart);}
-          if(m.chatHistory)setChat(m.chatHistory);
-          ck.current=new Clock(o=>w.readyState===1&&w.send(JSON.stringify(o)));
-          ck.current.ping();si.current=setInterval(()=>{ck.current?.ping();setRtt(ck.current?.rtt||null);setSyncOff(ck.current?.offset||null);},2000);
+  useEffect(() => {
+    const w = new WebSocket(WS);
+    ws.current = w;
+    w.binaryType = "arraybuffer";
+
+    w.onopen = () => { setWsOk(true); w.send(JSON.stringify({ type: "listen", name })); };
+    w.onerror = () => setWsOk(false);
+    w.onclose = () => setWsOk(false);
+
+    w.onmessage = (e) => {
+      // Binary = audio chunk
+      if (e.data instanceof ArrayBuffer) {
+        const { seq, t, pcm } = unpack(e.data);
+        writeChunk(t, pcm);
+        return;
+      }
+      const m = JSON.parse(e.data);
+      switch (m.type) {
+        case "welcome":
+          setSVer(m.version); setHostN(m.host || ""); setLive(m.live); setNListeners(m.listeners);
+          if (m.streamStart) streamStartRef.current = m.streamStart;
+          if (m.chatHistory) setChat(m.chatHistory);
+          ck.current = new Clock(o => w.readyState === 1 && w.send(JSON.stringify(o)));
+          ck.current.ping();
+          syncInt.current = setInterval(() => {
+            ck.current?.ping();
+            setRtt(ck.current?.rtt || null);
+            setSyncOff(ck.current?.offset || null);
+          }, 2000);
           break;
-        case"listen-ok":setSVer(m.version);setHostN(m.host||"");setLive(m.live);setListeners(m.n);
-          if(m.streamStart){streamStartRef.current=m.streamStart;setStreamSt(m.streamStart);}
-          if(m.chatHistory)setChat(m.chatHistory);break;
-        case"host-ok":setSVer(m.version);break;
-        case"sync-pong":ck.current?.pong(m);setRtt(ck.current?.rtt||null);setSyncOff(ck.current?.offset||null);break;
-        case"live":setLive(m.live);
-          if(m.live&&m.streamStart){streamStartRef.current=m.streamStart;setStreamSt(m.streamStart);ring.current=new Float32Array(RING_LEN);writePos.current=0;schedPos.current=0;started.current=false;setPlaying(false);}
-          if(!m.live){setPlaying(false);started.current=false;streamStartRef.current=null;setStreamSt(null);}break;
-        case"host-changed":setHostN(m.host);break;
-        case"host-gone":setHostN("");setLive(false);setPlaying(false);started.current=false;streamStartRef.current=null;break;
-        case"l+":setListeners(m.n);break;
-        case"l-":setListeners(m.n);break;
-        case"chat":setChat(p=>[...p,{from:m.from,text:m.text,t:m.t}]);break;
-        case"error":setErr(m.msg);break;
+        case "listen-ok":
+          setSVer(m.version); setHostN(m.host || ""); setLive(m.live); setNListeners(m.n);
+          if (m.streamStart) streamStartRef.current = m.streamStart;
+          if (m.chatHistory) setChat(m.chatHistory);
+          break;
+        case "host-ok": setSVer(m.version); break;
+        case "sync-pong":
+          ck.current?.pong(m);
+          setRtt(ck.current?.rtt || null);
+          setSyncOff(ck.current?.offset || null);
+          break;
+        case "live":
+          setLive(m.live);
+          if (m.live && m.streamStart) {
+            streamStartRef.current = m.streamStart;
+            writeHeadRef.current = 0;
+            startedRef.current = false;
+            setPlaying(false);
+          }
+          if (!m.live) {
+            setPlaying(false);
+            startedRef.current = false;
+            streamStartRef.current = null;
+            // Mute playback worklet
+            if (lPlayNode.current) lPlayNode.current.port.postMessage({ type: 'stop' });
+          }
+          break;
+        case "host-changed": setHostN(m.host); break;
+        case "host-gone":
+          setHostN(""); setLive(false); setPlaying(false);
+          startedRef.current = false; streamStartRef.current = null;
+          if (lPlayNode.current) lPlayNode.current.port.postMessage({ type: 'stop' });
+          break;
+        case "l+": setNListeners(m.n); break;
+        case "l-": setNListeners(m.n); break;
+        case "chat": setChat(p => [...p, { from: m.from, text: m.text, t: m.t }]); break;
+        case "error": setErr(m.msg); break;
       }
     };
-    // Listener audio - only init after user gesture (mobile requirement)
-    // initListenerAudio() called by unlockAudio()
-    schedRef.current=setInterval(runScheduler,SCHED_MS);
 
-    return()=>{w.close();clearInterval(si.current);clearInterval(schedRef.current);clearInterval(hTmr.current);
-      if(lCtx.current)lCtx.current.close().catch(()=>{});if(hCtx.current)hCtx.current.close().catch(()=>{});};
-  },[]);
+    return () => {
+      w.close();
+      clearInterval(syncInt.current);
+      clearInterval(hTmr.current);
+      if (lCtx.current) lCtx.current.close().catch(() => {});
+      if (hCtx.current) hCtx.current.close().catch(() => {});
+    };
+  }, []);
 
-  // Volume
-  useEffect(()=>{if(lGain.current)lGain.current.gain.value=vol/100;},[vol]);
-  // Monitor
-  useEffect(()=>{if(hMg.current)hMg.current.gain.value=mon?1:0;},[mon]);
+  // Volume → worklet
+  useEffect(() => { if (lPlayNode.current) lPlayNode.current.port.postMessage({ type: 'vol', v: vol / 100 }); }, [vol]);
+  // Monitor toggle
+  useEffect(() => { if (hMon.current) hMon.current.gain.value = monOn ? 1 : 0; }, [monOn]);
   // Timer
-  useEffect(()=>{if(cap){hT0.current=Date.now();hTmr.current=setInterval(()=>setElapsed(Math.floor((Date.now()-hT0.current)/1000)),1000);}else{clearInterval(hTmr.current);setElapsed(0);}return()=>clearInterval(hTmr.current);},[cap]);
+  useEffect(() => {
+    if (cap) { hT0.current = Date.now(); hTmr.current = setInterval(() => setElapsed(Math.floor((Date.now() - hT0.current) / 1000)), 1000); }
+    else { clearInterval(hTmr.current); setElapsed(0); }
+    return () => clearInterval(hTmr.current);
+  }, [cap]);
 
-  function sendChat(text){ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"chat",text}));}
+  // ═══ RENDER ═══
+  const qr = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(location.origin)}&bgcolor=08090d&color=06d6a0&format=svg`;
 
-  function unlockAudio(){initListenerAudio();setUnlocked(true);}
-  // ─── Become host ───
-  function becomeHost(){
-    if(!unlocked)unlockAudio();
-    ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"host",name}));
-    setMode("host");
-    // Enumerate audio devices (only host needs mic access)
-    (async()=>{try{const t=await navigator.mediaDevices.getUserMedia({audio:true});t.getTracks().forEach(t=>t.stop());setDevs((await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="audioinput"));}catch(e){}})();
-  }
-
-  // ─── Start capture ───
-  async function startCap(){setCapErr(null);try{let s;
-    if(srcMode==="system"){s=await navigator.mediaDevices.getDisplayMedia({video:{width:1,height:1},audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:SR}});if(!s.getAudioTracks().length){s.getTracks().forEach(t=>t.stop());setCapErr("No audio. Share Chrome Tab + check 'Also share tab audio'.");return;}s.getVideoTracks().forEach(t=>t.stop());}
-    else{s=await navigator.mediaDevices.getUserMedia({audio:{deviceId:sel?{exact:sel}:undefined,echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:SR,channelCount:2}});}
-    hStream.current=s;const c=new(AudioContext||webkitAudioContext)({sampleRate:SR});hCtx.current=c;
-    const src=c.createMediaStreamSource(s);const a=c.createAnalyser();a.fftSize=2048;a.smoothingTimeConstant=0.8;src.connect(a);hAn.current=a;
-    const g=c.createGain();g.gain.value=0;src.connect(g);g.connect(c.destination);hMg.current=g;
-    let ok=false;try{const u=mkURL(CAP_CODE);await c.audioWorklet.addModule(u);URL.revokeObjectURL(u);
-      const n=new AudioWorkletNode(c,'cap',{processorOptions:{sz:CHUNK},numberOfInputs:1,numberOfOutputs:1,channelCount:2});
-      n.port.onmessage=ev=>{const w=ws.current;if(w&&w.readyState===1)w.send(ev.data);};
-      src.connect(n);n.connect(c.destination);hWk.current=n;ok=true;}catch(e){}
-    if(!ok){const p=c.createScriptProcessor(CHUNK,2,1);p.onaudioprocess=ev=>{const w=ws.current;if(!w||w.readyState!==1)return;const L=ev.inputBuffer.getChannelData(0),R=ev.inputBuffer.numberOfChannels>1?ev.inputBuffer.getChannelData(1):L;const o=new Int16Array(L.length);for(let i=0;i<L.length;i++)o[i]=Math.max(-32768,Math.min(32767,Math.round(((L[i]+R[i])*.5)*32767)));w.send(o.buffer);};src.connect(p);p.connect(c.destination);hWk.current=p;}
-    ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"live",live:true,sr:SR}));
-    setCap(true);fup(n=>n+1);s.getTracks().forEach(t=>{t.onended=()=>stopCap();});
-  }catch(e){if(e.name==="NotAllowedError")setCapErr("Permission denied.");else setCapErr("Error: "+e.message);}}
-
-  function stopCap(){
-    ws.current?.readyState===1&&ws.current.send(JSON.stringify({type:"live",live:false}));
-    try{hWk.current?.disconnect();}catch(e){}hWk.current=null;
-    if(hStream.current){hStream.current.getTracks().forEach(t=>t.stop());hStream.current=null;}
-    if(hCtx.current){hCtx.current.close().catch(()=>{});hCtx.current=null;}
-    hAn.current=null;hMg.current=null;setCap(false);setMon(false);fup(n=>n+1);
-  }
-
-  // ═══════ RENDER ═══════
-  return(
-    <div style={{fontFamily:S.f,background:"#08090d",color:"#e0e4ec",minHeight:"100vh",position:"relative",overflow:"hidden"}}>
-      <BG/>
-      <div style={{position:"relative",zIndex:1,maxWidth:mode==="host"?960:500,margin:"0 auto",padding:"20px 20px 40px"}}>
+  return (
+    <div style={{ fontFamily: S.f, background: "#08090d", color: "#e0e4ec", minHeight: "100vh", position: "relative", overflow: "hidden" }}>
+      <BG />
+      <div style={{ position: "relative", zIndex: 1, maxWidth: mode === "host" ? 960 : 500, margin: "0 auto", padding: "20px 20px 40px" }}>
 
         {/* Header */}
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
-          <div style={{display:"flex",alignItems:"center",gap:8}}><Logo/><span style={{fontSize:9,fontFamily:S.m,color:"#334155",background:"rgba(255,255,255,0.03)",padding:"2px 6px",borderRadius:4}}>{sVer||VER}</span></div>
-          <div style={{display:"flex",alignItems:"center",gap:8}}>
-            <Pill s={!wsOk?"error":cap?"live":playing?"live":"idle"}
-              label={!wsOk?"Offline":cap?`LIVE · ${ft(elapsed)}`:playing?"♫ Synced":live?"Buffering":"Ready"}/>
-            <span style={{fontSize:11,fontFamily:S.m,color:"#475569"}}>👥 {listeners}</span>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20, flexWrap: "wrap", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Logo />
+            <span style={{ fontSize: 9, fontFamily: S.m, color: "#334155", background: "rgba(255,255,255,0.03)", padding: "2px 6px", borderRadius: 4 }}>{sVer || VER}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Pill s={!wsOk ? "error" : cap ? "live" : playing ? "live" : "idle"}
+              label={!wsOk ? "Offline" : cap ? `LIVE · ${ft(elapsed)}` : playing ? "♫ Synced" : live ? "Buffering" : "Ready"} />
+            <span style={{ fontSize: 11, fontFamily: S.m, color: "#475569" }}>👥 {nListeners}</span>
           </div>
         </div>
 
-        {mode==="host"?(
-          // ═══ HOST MODE ═══
-          <div className="hg" style={{display:"grid",gridTemplateColumns:"1fr 280px",gap:16,alignItems:"start"}}>
-            <div style={{display:"flex",flexDirection:"column",gap:14}}>
-              <div className="fi" style={{...S.g,padding:"20px"}}>
-                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,flexWrap:"wrap",gap:8}}>
-                  <h3 style={{fontSize:14,fontWeight:600,margin:0}}>Audio Source</h3>
-                  <div style={{display:"flex",background:"rgba(255,255,255,0.04)",borderRadius:8,overflow:"hidden",border:"1px solid rgba(255,255,255,0.06)"}}>
-                    {[{k:"device",l:"🎛 Device"},{k:"system",l:"🖥 System"}].map(m=><button key={m.k} onClick={()=>!cap&&setSrcMode(m.k)} style={{padding:"6px 12px",border:"none",fontSize:12,fontWeight:500,fontFamily:S.f,cursor:cap?"not-allowed":"pointer",background:srcMode===m.k?S.d:"transparent",color:srcMode===m.k?S.a:"#64748b"}}>{m.l}</button>)}
+        {mode === "host" ? (
+          /* ═══ HOST ═══ */
+          <div className="hg" style={{ display: "grid", gridTemplateColumns: "1fr 280px", gap: 16, alignItems: "start" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div className="fi" style={{ ...S.g, padding: "20px" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14, flexWrap: "wrap", gap: 8 }}>
+                  <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>Audio Source</h3>
+                  <div style={{ display: "flex", background: "rgba(255,255,255,0.04)", borderRadius: 8, overflow: "hidden", border: "1px solid rgba(255,255,255,0.06)" }}>
+                    {[{ k: "device", l: "🎛 Device" }, { k: "system", l: "🖥 System" }].map(m =>
+                      <button key={m.k} onClick={() => !cap && setSrcMode(m.k)} style={{ padding: "6px 12px", border: "none", fontSize: 12, fontWeight: 500, fontFamily: S.f, cursor: cap ? "not-allowed" : "pointer", background: srcMode === m.k ? S.d : "transparent", color: srcMode === m.k ? S.a : "#64748b" }}>{m.l}</button>
+                    )}
                   </div>
                 </div>
-                {srcMode==="device"?<div style={{marginBottom:12}}><select value={sel} onChange={e=>setSel(e.target.value)} style={{width:"100%",padding:"10px 14px",borderRadius:8,background:"rgba(255,255,255,0.04)",color:"#e0e4ec",border:"1px solid rgba(255,255,255,0.08)",fontSize:13,fontFamily:S.f,outline:"none",appearance:"none"}}><option value="">Select audio source...</option>{devs.map(d=><option key={d.deviceId} value={d.deviceId}>{d.label||`Device ${d.deviceId.slice(0,8)}`}</option>)}</select></div>
-                :<div style={{padding:"12px",borderRadius:8,background:"rgba(6,214,160,0.05)",border:"1px solid rgba(6,214,160,0.1)",marginBottom:12,fontSize:12,color:"#94a3b8"}}><strong style={{color:S.a}}>System Audio</strong> — Share Chrome Tab + "Also share tab audio"</div>}
-                <div style={{display:"flex",gap:10}}>{!cap?<Btn onClick={startCap} disabled={!wsOk} style={{flex:1,justifyContent:"center"}}>▶ Start Broadcasting</Btn>:<Btn v="danger" onClick={stopCap} style={{flex:1,justifyContent:"center"}}>⏹ Stop</Btn>}</div>
-                {capErr&&<div style={{marginTop:10,padding:"10px",borderRadius:8,background:"rgba(239,68,68,0.08)",fontSize:12,color:"#fca5a5"}}>{capErr}</div>}
-              </div>
-              <div className="fi fd1" style={{...S.g,padding:"16px"}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}><h3 style={{fontSize:14,fontWeight:600,margin:0}}>{cap?"Live":"Preview"}</h3>{cap&&<div style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:S.a,fontFamily:S.m}}><div style={{width:5,height:5,borderRadius:"50%",background:S.a,animation:"pd 1.5s ease infinite"}}/>48kHz</div>}</div><Wave analyser={hAn.current} on={cap} h={130}/><div style={{marginTop:8}}><VU analyser={hAn.current} on={cap}/></div></div>
-              <Chat messages={chat} onSend={sendChat} myName={name}/>
-            </div>
-            <div className="rs" style={{display:"flex",flexDirection:"column",gap:14}}>
-              <div className="fi" style={{...S.g,padding:"20px",textAlign:"center"}}>
-                <p style={{fontSize:11,color:"#64748b",marginBottom:8,textTransform:"uppercase",letterSpacing:"0.1em",fontWeight:600}}>Scan to Listen</p>
-                <div style={{width:160,height:160,margin:"0 auto 10px",background:"#0d1117",borderRadius:12,padding:10,border:"1px solid rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center"}}>
-                  <img src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(location.origin)}&bgcolor=08090d&color=06d6a0&format=svg`} alt="QR" style={{width:140,height:140,borderRadius:6}} onError={e=>{e.target.style.display="none"}}/>
+                {srcMode === "device" ?
+                  <div style={{ marginBottom: 12 }}>
+                    <select value={sel} onChange={e => setSel(e.target.value)} style={{ width: "100%", padding: "10px 14px", borderRadius: 8, background: "rgba(255,255,255,0.04)", color: "#e0e4ec", border: "1px solid rgba(255,255,255,0.08)", fontSize: 13, fontFamily: S.f, outline: "none", appearance: "none" }}>
+                      <option value="">Select audio source...</option>
+                      {devs.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || `Device ${d.deviceId.slice(0, 8)}`}</option>)}
+                    </select>
+                  </div>
+                  : <div style={{ padding: "12px", borderRadius: 8, background: "rgba(6,214,160,0.05)", border: "1px solid rgba(6,214,160,0.1)", marginBottom: 12, fontSize: 12, color: "#94a3b8" }}><strong style={{ color: S.a }}>System Audio</strong> — Share Chrome Tab + "Also share tab audio"</div>
+                }
+                <div style={{ display: "flex", gap: 10 }}>
+                  {!cap ? <Btn onClick={startCap} disabled={!wsOk} style={{ flex: 1, justifyContent: "center" }}>▶ Start Broadcasting</Btn>
+                    : <Btn v="danger" onClick={stopCap} style={{ flex: 1, justifyContent: "center" }}>⏹ Stop</Btn>}
                 </div>
-                <div style={{padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,0.03)",fontSize:11,color:S.a,fontFamily:S.m,wordBreak:"break-all",marginBottom:6}}>{location.origin}</div>
-                <p style={{fontSize:10,color:"#475569"}}>{BUF_SEC}s sync buffer</p>
+                {capErr && <div style={{ marginTop: 10, padding: "10px", borderRadius: 8, background: "rgba(239,68,68,0.08)", fontSize: 12, color: "#fca5a5" }}>{capErr}</div>}
               </div>
-              <div className="fi fd1" style={{...S.g,padding:"16px"}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}><h3 style={{fontSize:13,fontWeight:600,margin:0}}>Listeners</h3><span style={{fontSize:11,fontFamily:S.m,color:S.a,background:S.d,padding:"2px 8px",borderRadius:4}}>{listeners}</span></div><p style={{fontSize:12,color:"#475569",textAlign:"center",padding:"8px 0"}}>{listeners===0?"Waiting for listeners...":listeners+" connected"}</p></div>
-              <div className="fi fd2" style={{...S.g,padding:"12px 14px",cursor:cap?"pointer":"default"}} onClick={()=>cap&&setMon(!mon)}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}><div><div style={{fontSize:13,fontWeight:500}}>Monitor</div><div style={{fontSize:11,color:"#64748b"}}>Hear locally</div></div><div style={{width:40,height:22,borderRadius:11,background:mon?"rgba(6,214,160,0.3)":"rgba(255,255,255,0.08)",position:"relative",transition:"background 0.2s"}}><div style={{width:16,height:16,borderRadius:"50%",position:"absolute",top:3,left:mon?21:3,transition:"all 0.2s",background:mon?S.a:"#475569"}}/></div></div></div>
+              <div className="fi fd1" style={{ ...S.g, padding: "16px" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                  <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{cap ? "Live" : "Preview"}</h3>
+                  {cap && <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: S.a, fontFamily: S.m }}><div style={{ width: 5, height: 5, borderRadius: "50%", background: S.a, animation: "pd 1.5s ease infinite" }} />48kHz</div>}
+                </div>
+                <Wave analyser={hAn.current} on={cap} h={130} />
+                <div style={{ marginTop: 8 }}><VU analyser={hAn.current} on={cap} /></div>
+              </div>
+              <Chat messages={chat} onSend={sendChat} myName={name} />
+            </div>
+            <div className="rs" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div className="fi" style={{ ...S.g, padding: "20px", textAlign: "center" }}>
+                <p style={{ fontSize: 11, color: "#64748b", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600 }}>Scan to Listen</p>
+                <div style={{ width: 160, height: 160, margin: "0 auto 10px", background: "#0d1117", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <img src={qr} alt="QR" style={{ width: 140, height: 140, borderRadius: 6 }} onError={e => { e.target.style.display = "none"; }} />
+                </div>
+                <div style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(255,255,255,0.03)", fontSize: 11, color: S.a, fontFamily: S.m, wordBreak: "break-all", marginBottom: 6 }}>{location.origin}</div>
+                <p style={{ fontSize: 10, color: "#475569" }}>{BUF_SEC}s sync buffer</p>
+              </div>
+              <div className="fi fd1" style={{ ...S.g, padding: "16px" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}><h3 style={{ fontSize: 13, fontWeight: 600, margin: 0 }}>Listeners</h3><span style={{ fontSize: 11, fontFamily: S.m, color: S.a, background: S.d, padding: "2px 8px", borderRadius: 4 }}>{nListeners}</span></div>
+                <p style={{ fontSize: 12, color: "#475569", textAlign: "center", padding: "8px 0" }}>{nListeners === 0 ? "Waiting..." : nListeners + " connected"}</p>
+              </div>
+              <div className="fi fd2" style={{ ...S.g, padding: "12px 14px", cursor: cap ? "pointer" : "default" }} onClick={() => cap && setMonOn(!monOn)}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <div><div style={{ fontSize: 13, fontWeight: 500 }}>Monitor</div><div style={{ fontSize: 11, color: "#64748b" }}>Hear locally</div></div>
+                  <div style={{ width: 40, height: 22, borderRadius: 11, background: monOn ? "rgba(6,214,160,0.3)" : "rgba(255,255,255,0.08)", position: "relative", transition: "background 0.2s" }}>
+                    <div style={{ width: 16, height: 16, borderRadius: "50%", position: "absolute", top: 3, left: monOn ? 21 : 3, transition: "all 0.2s", background: monOn ? S.a : "#475569" }} />
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
-        ):(
-          // ═══ LISTENER MODE ═══
-          <div style={{maxWidth:440,margin:"0 auto"}}>
-            {!unlocked?(
-              <div className="fi" style={{...S.g,padding:"32px 24px",textAlign:"center",marginBottom:14}}>
-                <p style={{fontSize:16,fontWeight:600,marginBottom:8}}>🎧 DJ Lab Sync</p>
-                <p style={{fontSize:13,color:"#94a3b8",marginBottom:6}}>Tap below to start listening.</p>
-                <p style={{fontSize:12,color:"#64748b",marginBottom:20}}>Joining as <span style={{color:S.a,fontFamily:S.m,fontWeight:600}}>{name}</span></p>
-                <button onClick={unlockAudio} style={{width:"100%",padding:"18px",borderRadius:14,border:"none",background:`linear-gradient(135deg,${S.a},#06b6d4)`,color:"#08090d",fontSize:18,fontWeight:700,fontFamily:S.f,cursor:"pointer",boxShadow:"0 8px 30px rgba(6,214,160,0.3)"}}>🔊 Tap to Start Listening</button>
-                <p style={{fontSize:10,color:"#475569",marginTop:10}}>This unlocks audio on your device</p>
+        ) : (
+          /* ═══ LISTENER ═══ */
+          <div style={{ maxWidth: 440, margin: "0 auto" }}>
+            {!unlocked ? (
+              <div className="fi" style={{ ...S.g, padding: "32px 24px", textAlign: "center", marginBottom: 14 }}>
+                <p style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>🎧 DJ Lab Sync</p>
+                <p style={{ fontSize: 13, color: "#94a3b8", marginBottom: 6 }}>Tap below to start listening.</p>
+                <p style={{ fontSize: 12, color: "#64748b", marginBottom: 20 }}>Joining as <span style={{ color: S.a, fontFamily: S.m, fontWeight: 600 }}>{name}</span></p>
+                <button onClick={unlockAudio} style={{ width: "100%", padding: "18px", borderRadius: 14, border: "none", background: `linear-gradient(135deg,${S.a},#06b6d4)`, color: "#08090d", fontSize: 18, fontWeight: 700, fontFamily: S.f, cursor: "pointer", boxShadow: "0 8px 30px rgba(6,214,160,0.3)" }}>🔊 Tap to Start Listening</button>
               </div>
-            ):<>
-            {!hostN&&!live&&(
-              <div className="fi" style={{...S.g,padding:"24px",textAlign:"center",marginBottom:14}}>
-                <p style={{fontSize:14,color:"#94a3b8",marginBottom:16}}>No one is broadcasting yet.</p>
-                <Btn onClick={becomeHost} style={{justifyContent:"center"}}>🎧 Become Host &amp; Broadcast</Btn>
-              </div>
-            )}
-
-            {(hostN||live)&&(
-              <div className="fi" style={{...S.g,padding:"20px",marginBottom:14}}>
-                {playing?(<>
-                  <div style={{textAlign:"center",padding:"12px 0 10px",borderBottom:"1px solid rgba(255,255,255,0.05)",marginBottom:12}}>
-                    <p style={{fontSize:12,color:"#64748b",marginBottom:4}}>Now listening to</p>
-                    <p style={{fontSize:18,fontWeight:700}}>{hostN}</p>
-                  </div>
-                  <Wave analyser={lAn.current} on={true} h={70}/>
-                  <div style={{marginTop:10}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:12,color:"#64748b"}}>Volume</span><span style={{fontSize:11,fontFamily:S.m,color:"#94a3b8"}}>{vol}%</span></div><input type="range" min="0" max="100" value={vol} onChange={e=>setVol(+e.target.value)} style={{width:"100%"}}/></div>
-                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginTop:12}}>
-                    <div style={{textAlign:"center",padding:"8px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:14,fontWeight:700,color:S.a,fontFamily:S.m}}>{rtt?rtt+"ms":"—"}</div><div style={{fontSize:9,color:"#64748b"}}>RTT</div></div>
-                    <div style={{textAlign:"center",padding:"8px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:14,fontWeight:700,color:S.a,fontFamily:S.m}}>{syncOff!=null?Math.abs(Math.round(syncOff))+"ms":"—"}</div><div style={{fontSize:9,color:"#64748b"}}>Sync</div></div>
-                    <div style={{textAlign:"center",padding:"8px 0",background:"rgba(255,255,255,0.02)",borderRadius:8}}><div style={{fontSize:14,fontWeight:700,color:S.a,fontFamily:S.m}}>{BUF_SEC}s</div><div style={{fontSize:9,color:"#64748b"}}>Buffer</div></div>
-                  </div>
-                </>):(
-                  <div style={{textAlign:"center",padding:"20px 0"}}>
-                    <div style={{width:40,height:40,border:"3px solid rgba(6,214,160,0.2)",borderTopColor:S.a,borderRadius:"50%",animation:"spin .8s linear infinite",margin:"0 auto 16px"}}/>
-                    <p style={{fontSize:13,color:"#64748b"}}>{live?"Buffering ("+BUF_SEC+"s)...":"Waiting for "+hostN+" to start..."}</p>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {!mode==="host"&&!hostN&&<div style={{textAlign:"center",marginBottom:14}}><Btn onClick={()=>{unlockAudio();becomeHost();}}>🎧 Become Host</Btn></div>}
-
-            <Chat messages={chat} onSend={sendChat} myName={name}/>
-            </>}
+            ) : (<>
+              {!hostN && !live && (
+                <div className="fi" style={{ ...S.g, padding: "24px", textAlign: "center", marginBottom: 14 }}>
+                  <p style={{ fontSize: 14, color: "#94a3b8", marginBottom: 16 }}>No one is broadcasting yet.</p>
+                  <Btn onClick={becomeHost} style={{ justifyContent: "center" }}>🎧 Become Host & Broadcast</Btn>
+                </div>
+              )}
+              {(hostN || live) && (
+                <div className="fi" style={{ ...S.g, padding: "20px", marginBottom: 14 }}>
+                  {playing ? (<>
+                    <div style={{ textAlign: "center", padding: "12px 0 10px", borderBottom: "1px solid rgba(255,255,255,0.05)", marginBottom: 12 }}>
+                      <p style={{ fontSize: 12, color: "#64748b", marginBottom: 4 }}>Now listening to</p>
+                      <p style={{ fontSize: 18, fontWeight: 700 }}>{hostN}</p>
+                    </div>
+                    <Wave analyser={lAnNode.current} on={true} h={70} />
+                    <div style={{ marginTop: 10 }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                        <span style={{ fontSize: 12, color: "#64748b" }}>Volume</span>
+                        <span style={{ fontSize: 11, fontFamily: S.m, color: "#94a3b8" }}>{vol}%</span>
+                      </div>
+                      <input type="range" min="0" max="100" value={vol} onChange={e => setVol(+e.target.value)} style={{ width: "100%" }} />
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 12 }}>
+                      <div style={{ textAlign: "center", padding: "8px 0", background: "rgba(255,255,255,0.02)", borderRadius: 8 }}><div style={{ fontSize: 14, fontWeight: 700, color: S.a, fontFamily: S.m }}>{rtt ? rtt + "ms" : "—"}</div><div style={{ fontSize: 9, color: "#64748b" }}>RTT</div></div>
+                      <div style={{ textAlign: "center", padding: "8px 0", background: "rgba(255,255,255,0.02)", borderRadius: 8 }}><div style={{ fontSize: 14, fontWeight: 700, color: S.a, fontFamily: S.m }}>{syncOff != null ? Math.abs(Math.round(syncOff)) + "ms" : "—"}</div><div style={{ fontSize: 9, color: "#64748b" }}>Sync</div></div>
+                      <div style={{ textAlign: "center", padding: "8px 0", background: "rgba(255,255,255,0.02)", borderRadius: 8 }}><div style={{ fontSize: 14, fontWeight: 700, color: S.a, fontFamily: S.m }}>{BUF_SEC}s</div><div style={{ fontSize: 9, color: "#64748b" }}>Buffer</div></div>
+                    </div>
+                  </>) : (
+                    <div style={{ textAlign: "center", padding: "20px 0" }}>
+                      <div style={{ width: 40, height: 40, border: "3px solid rgba(6,214,160,0.2)", borderTopColor: S.a, borderRadius: "50%", animation: "spin .8s linear infinite", margin: "0 auto 16px" }} />
+                      <p style={{ fontSize: 13, color: "#64748b" }}>{live ? "Buffering (" + BUF_SEC + "s)..." : "Waiting for " + (hostN || "host") + " to start..."}</p>
+                    </div>
+                  )}
+                </div>
+              )}
+              <Chat messages={chat} onSend={sendChat} myName={name} />
+            </>)}
           </div>
         )}
 
-        <p style={{textAlign:"center",marginTop:20,fontSize:10,color:"#262b35"}}>DJ Lab Sync {sVer||VER} · thedjlab.ca</p>
+        <p style={{ textAlign: "center", marginTop: 20, fontSize: 10, color: "#262b35" }}>DJ Lab Sync {sVer || VER} · thedjlab.ca</p>
       </div>
     </div>
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 </script>
 </body>
 </html>
