@@ -19,7 +19,7 @@ select option{background:#1a1d27;color:#e0e4ec}@keyframes pd{0%,100%{opacity:1}5
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script type="text/babel">
 const{useState,useRef,useEffect}=React;
-const VER="v7.2";
+const VER="v7.3";
 const WS=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";
 const SR=48000;
 const CHUNK=8192;
@@ -124,6 +124,7 @@ function App(){
   const bufferingRef=useRef(true);
   const chunkQueueRef=useRef([]);    // queued during buffer phase: {f32, seq}
   const startTimeComputed=useRef(false);
+  const lastResyncRef=useRef(0); // Date.now() of last resync
 
   // ─── Listener: play a single chunk at exact time ───
   function playChunk(float32, playTime) {
@@ -154,6 +155,7 @@ function App(){
     const waitMs = targetServerMs - clock.now();
     startTimeRef.current = c.currentTime + waitMs / 1000;
     startTimeComputed.current = true;
+    lastResyncRef.current = Date.now();
     return true;
   }
 
@@ -190,6 +192,13 @@ function App(){
         if (!playing) setPlaying(true);
       }
     } else {
+      // Drift correction: recompute startTime every 30 seconds from NTP
+      // This corrects hardware clock drift between devices
+      const now = Date.now();
+      if (now - lastResyncRef.current > 30000 && ck.current?.ready) {
+        computeStartTime();
+        lastResyncRef.current = now;
+      }
       // After buffering: schedule directly using server seq — skip if past
       const playTime = startTimeRef.current + (seq - 1) * CHUNK_DUR;
       if (playTime >= lCtx.current.currentTime - 0.01) playChunk(f32, playTime);
@@ -199,6 +208,7 @@ function App(){
   function resetPlayback() {
     startTimeRef.current = null;
     startTimeComputed.current = false;
+    lastResyncRef.current = 0;
     bufferingRef.current = true;
     chunkQueueRef.current = [];
     setPlaying(false);
