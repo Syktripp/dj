@@ -19,7 +19,7 @@ select option{background:#1a1d27;color:#e0e4ec}@keyframes pd{0%,100%{opacity:1}5
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script type="text/babel">
 const{useState,useRef,useEffect}=React;
-const VER="v7.7";
+const VER="v7.4";
 const WS=(location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws";
 const SR=48000;
 const CHUNK=8192;
@@ -111,9 +111,6 @@ function App(){
   // Listener
   const[unlocked,setUnlocked]=useState(false);const[playing,setPlaying]=useState(false);const[vol,setVol]=useState(85);
   const[rtt,setRtt]=useState(null);const[syncOff,setSyncOff]=useState(null);
-  const[calibrating,setCalibrating]=useState(false);const[offsetMs,setOffsetMs]=useState(0);
-  const[calStep,setCalStep]=useState(null); // null | "visual" | "audio" | "done"
-  const[visTaps,setVisTaps]=useState([]);const[audTaps,setAudTaps]=useState([]);
   const[,fup]=useState(0);
 
   // Refs
@@ -127,12 +124,7 @@ function App(){
   const bufferingRef=useRef(true);
   const chunkQueueRef=useRef([]);    // queued during buffer phase: {f32, seq}
   const startTimeComputed=useRef(false);
-  const lastResyncRef=useRef(0);
-  const offsetRef=useRef(0);
-  const metronomeRef=useRef(null);
-  const flashRef=useRef(null);
-  const lastBeatRef=useRef(0);
-  const wakeLockRef=useRef(null); // timestamp of last beat for tap measurement
+  const lastResyncRef=useRef(0); // Date.now() of last resync
 
   // ─── Listener: play a single chunk at exact time ───
   function playChunk(float32, playTime) {
@@ -193,7 +185,7 @@ function App(){
         // Flush queue — skip chunks whose playTime is in the past
         bufferingRef.current = false;
         for (const q of chunkQueueRef.current) {
-          const playTime = startTimeRef.current + (q.seq - 1) * CHUNK_DUR + offsetRef.current;
+          const playTime = startTimeRef.current + (q.seq - 1) * CHUNK_DUR;
           if (playTime >= c.currentTime - 0.01) playChunk(q.f32, playTime);
         }
         chunkQueueRef.current = [];
@@ -203,12 +195,12 @@ function App(){
       // Drift correction: recompute startTime every 30 seconds from NTP
       // This corrects hardware clock drift between devices
       const now = Date.now();
-      if (now - lastResyncRef.current > 1000 && ck.current?.ready) {
+      if (now - lastResyncRef.current > 5000 && ck.current?.ready) {
         computeStartTime();
         lastResyncRef.current = now;
       }
       // After buffering: schedule directly using server seq — skip if past
-      const playTime = startTimeRef.current + (seq - 1) * CHUNK_DUR + offsetRef.current;
+      const playTime = startTimeRef.current + (seq - 1) * CHUNK_DUR;
       if (playTime >= lCtx.current.currentTime - 0.01) playChunk(f32, playTime);
     }
   }
@@ -320,99 +312,6 @@ function App(){
   useEffect(() => { if (hMon.current) hMon.current.gain.value = monOn ? 1 : 0; }, [monOn]);
   useEffect(() => { if (cap) { hT0.current = Date.now(); hTmr.current = setInterval(() => setElapsed(Math.floor((Date.now() - hT0.current) / 1000)), 1000); } else { clearInterval(hTmr.current); setElapsed(0); } return () => clearInterval(hTmr.current); }, [cap]);
 
-  // Offset sync
-  useEffect(() => { offsetRef.current = offsetMs / 1000; }, [offsetMs]);
-
-  // Wake lock — keep phone screen on during playback
-  useEffect(() => {
-    async function acquire() {
-      try {
-        if (navigator.wakeLock) {
-          wakeLockRef.current = await navigator.wakeLock.request('screen');
-          wakeLockRef.current.addEventListener('release', () => { wakeLockRef.current = null; });
-        }
-      } catch (e) {}
-    }
-    if (playing) acquire();
-    else if (wakeLockRef.current) { wakeLockRef.current.release().catch(() => {}); wakeLockRef.current = null; }
-    // Re-acquire on visibility change (browser releases on tab switch)
-    function onVis() { if (document.visibilityState === 'visible' && playing) acquire(); }
-    document.addEventListener('visibilitychange', onVis);
-    return () => {
-      document.removeEventListener('visibilitychange', onVis);
-      if (wakeLockRef.current) wakeLockRef.current.release().catch(() => {});
-    };
-  }, [playing]);
-
-  // Metronome: flash + optional click, tracks beat time for tap measurement
-  useEffect(() => {
-    if (!calibrating || !calStep) { clearInterval(metronomeRef.current); return; }
-    let lastFired = 0;
-    function tick() {
-      const clock = ck.current;
-      if (!clock || !clock.ready) return;
-      const serverMs = clock.now();
-      const msBeat = serverMs % 1000;
-      if (msBeat < 40 || msBeat > 960) {
-        const beatTime = Math.round(serverMs / 1000) * 1000;
-        if (beatTime !== lastFired) {
-          lastFired = beatTime;
-          lastBeatRef.current = performance.now();
-          // Flash
-          if (flashRef.current) flashRef.current.style.opacity = "1";
-          setTimeout(() => { if (flashRef.current) flashRef.current.style.opacity = "0.08"; }, 80);
-          // Click only in audio step
-          if (calStep === "audio" && lCtx.current && lCtx.current.state !== "closed") {
-            const c = lCtx.current;
-            const osc = c.createOscillator();
-            const g = c.createGain();
-            osc.frequency.value = 1000;
-            g.gain.setValueAtTime(0.4, c.currentTime);
-            g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 0.05);
-            osc.connect(g); g.connect(c.destination);
-            osc.start(c.currentTime); osc.stop(c.currentTime + 0.05);
-          }
-        }
-      }
-    }
-    metronomeRef.current = setInterval(tick, 15);
-    return () => clearInterval(metronomeRef.current);
-  }, [calibrating, calStep]);
-
-  // Handle calibration tap
-  function handleCalTap() {
-    if (!lastBeatRef.current) return;
-    const delay = performance.now() - lastBeatRef.current;
-    if (delay > 800) return; // too late, ignore
-    if (calStep === "visual") {
-      const next = [...visTaps, delay];
-      setVisTaps(next);
-      if (next.length >= 5) {
-        setCalStep("audio");
-      }
-    } else if (calStep === "audio") {
-      const next = [...audTaps, delay];
-      setAudTaps(next);
-      if (next.length >= 5) {
-        // Calculate: BT latency = median(audio) - median(visual)
-        const median = arr => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
-        const visMedian = median(visTaps);
-        const audMedian = median(next);
-        const btLatency = Math.round(audMedian - visMedian);
-        const newOffset = -Math.max(0, btLatency); // negative = play earlier
-        setOffsetMs(newOffset);
-        setCalStep("done");
-      }
-    }
-  }
-
-  function startCalibration() {
-    setCalibrating(true);
-    setCalStep("visual");
-    setVisTaps([]);
-    setAudTaps([]);
-  }
-
   const qr = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(location.origin)}&bgcolor=08090d&color=06d6a0&format=svg`;
 
   // ═══ RENDER ═══
@@ -490,61 +389,6 @@ function App(){
                       <div style={{ textAlign: "center", padding: "8px 0", background: "rgba(255,255,255,0.02)", borderRadius: 8 }}><div style={{ fontSize: 14, fontWeight: 700, color: S.a, fontFamily: S.m }}>{syncOff != null ? Math.abs(Math.round(syncOff)) + "ms" : "—"}</div><div style={{ fontSize: 9, color: "#64748b" }}>Sync</div></div>
                       <div style={{ textAlign: "center", padding: "8px 0", background: "rgba(255,255,255,0.02)", borderRadius: 8 }}><div style={{ fontSize: 14, fontWeight: 700, color: S.a, fontFamily: S.m }}>{BUF_SEC}s</div><div style={{ fontSize: 9, color: "#64748b" }}>Buffer</div></div>
                     </div>
-
-                    {/* Calibrate button / panel */}
-                    {!calibrating ? (
-                      <Btn v="secondary" onClick={startCalibration} style={{ width: "100%", justifyContent: "center", marginTop: 12, fontSize: 12 }}>
-                        🎯 Calibrate Bluetooth
-                      </Btn>
-                    ) : (
-                      <div style={{ marginTop: 12, padding: 16, borderRadius: 10, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
-                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                          <span style={{ fontSize: 13, fontWeight: 600 }}>🎯 Calibration</span>
-                          <Btn v="secondary" onClick={() => { setCalibrating(false); setCalStep(null); }} style={{ padding: "4px 10px", fontSize: 11 }}>Close</Btn>
-                        </div>
-
-                        {/* Flash dot */}
-                        <div style={{ textAlign: "center", marginBottom: 14 }}>
-                          <div ref={flashRef} style={{ width: 60, height: 60, borderRadius: "50%", margin: "0 auto", background: S.a, opacity: 0.08, transition: "opacity 0.05s", boxShadow: "0 0 30px rgba(6,214,160,0.4)" }} />
-                        </div>
-
-                        {calStep === "visual" && (<>
-                          <p style={{ fontSize: 13, fontWeight: 600, textAlign: "center", marginBottom: 6, color: "#e0e4ec" }}>Step 1 of 2: Tap when you SEE the flash</p>
-                          <p style={{ fontSize: 11, color: "#64748b", textAlign: "center", marginBottom: 12 }}>This measures your reaction time</p>
-                          <button onClick={handleCalTap} style={{ width: "100%", padding: 20, borderRadius: 12, border: "2px solid rgba(6,214,160,0.3)", background: "rgba(6,214,160,0.06)", color: S.a, fontSize: 16, fontWeight: 700, fontFamily: S.f, cursor: "pointer" }}>
-                            👆 TAP ({visTaps.length}/5)
-                          </button>
-                        </>)}
-
-                        {calStep === "audio" && (<>
-                          <p style={{ fontSize: 13, fontWeight: 600, textAlign: "center", marginBottom: 6, color: "#e0e4ec" }}>Step 2 of 2: Tap when you HEAR the click</p>
-                          <p style={{ fontSize: 11, color: "#64748b", textAlign: "center", marginBottom: 12 }}>Listen through your Bluetooth speaker/earphones</p>
-                          <button onClick={handleCalTap} style={{ width: "100%", padding: 20, borderRadius: 12, border: "2px solid rgba(99,102,241,0.3)", background: "rgba(99,102,241,0.06)", color: "#818cf8", fontSize: 16, fontWeight: 700, fontFamily: S.f, cursor: "pointer" }}>
-                            👆 TAP ({audTaps.length}/5)
-                          </button>
-                        </>)}
-
-                        {calStep === "done" && (<>
-                          <p style={{ fontSize: 13, fontWeight: 600, textAlign: "center", marginBottom: 8, color: S.a }}>✓ Calibrated</p>
-                          <p style={{ fontSize: 12, textAlign: "center", color: "#94a3b8", marginBottom: 12 }}>
-                            Bluetooth latency detected: <strong style={{ color: S.a, fontFamily: S.m }}>{Math.abs(offsetMs)}ms</strong>
-                          </p>
-                          <div>
-                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-                              <span style={{ fontSize: 12, color: "#64748b" }}>Fine-tune</span>
-                              <span style={{ fontSize: 12, fontFamily: S.m, color: S.a, fontWeight: 600 }}>{offsetMs > 0 ? "+" : ""}{offsetMs}ms</span>
-                            </div>
-                            <input type="range" min="-500" max="500" step="5" value={offsetMs} onChange={e => setOffsetMs(Number(e.target.value))} style={{ width: "100%" }} />
-                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#475569", marginTop: 4 }}>
-                              <span>-500ms</span>
-                              <button onClick={() => setOffsetMs(0)} style={{ background: "none", border: "1px solid rgba(255,255,255,0.08)", color: "#64748b", borderRadius: 4, padding: "1px 6px", fontSize: 9, cursor: "pointer", fontFamily: S.f }}>Reset</button>
-                              <span>+500ms</span>
-                            </div>
-                          </div>
-                          <Btn v="secondary" onClick={startCalibration} style={{ width: "100%", justifyContent: "center", marginTop: 10, fontSize: 11 }}>Redo Calibration</Btn>
-                        </>)}
-                      </div>
-                    )}
                   </>) : (
                     <div style={{ textAlign: "center", padding: "20px 0" }}>
                       <div style={{ width: 40, height: 40, border: "3px solid rgba(6,214,160,0.2)", borderTopColor: S.a, borderRadius: "50%", animation: "spin .8s linear infinite", margin: "0 auto 16px" }} />
