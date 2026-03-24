@@ -3,7 +3,7 @@
  * No rooms. One server = one session.
  * Binary PCM relay, NTP sync, chat.
  */
-const VERSION = "v7.1";
+const VERSION = "v8.0";
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
